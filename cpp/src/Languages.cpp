@@ -433,6 +433,8 @@ static const char* kClassLang[4] = { "", "en", "he", "ru" };
 // ============================================================
 // Typo-resilient detection
 // ============================================================
+DetectTrace g_lastDetectTrace;
+
 bool RenormaliseScores(DetectionResult& r, const std::set<std::string>& disabledLangs) {
     float sum = r.scores[0];
     for (int i = 1; i < 4; ++i) {
@@ -467,6 +469,13 @@ std::optional<DetectionResult> TypoResilientDetect(
     // the remaining languages.
     std::set<std::string> excl = excludedLangs;
     excl.insert(disabledLangs.begin(), disabledLangs.end());
+    // Why the latest primary call did (not) fire — logged at fn_manual_switch.
+    auto trace = [&](const char* reason, const std::string& lang, float conf,
+                     float required, float margin, float incumbent, bool lexSup) {
+        if (isFallback) return;
+        g_lastDetectTrace = { reason, lang, conf, required, margin, incumbent,
+                              numChars, lexSup, GetTickCount() };
+    };
     auto predict = [&](const std::wstring& v) -> std::optional<DetectionResult> {
         auto r = detector.PredictLanguageWithConfidence(v);
         if (r && !disabledLangs.empty() && !RenormaliseScores(*r, disabledLangs))
@@ -568,6 +577,7 @@ std::optional<DetectionResult> TypoResilientDetect(
 
     if (bestLang.empty()) {
         if (!isFallback) history.Update("", 0.0f);
+        trace("no_candidate", "", 0, 0, 0, incumbentConf, false);
         return std::nullopt;
     }
 
@@ -614,6 +624,8 @@ std::optional<DetectionResult> TypoResilientDetect(
                           bestFullResult.scores[3] == 0.0f);
             history.Update(bestLang, bestConf, nsLow ? nullptr : bestFullResult.scores);
         }
+        trace("below_pair_min_chars", bestLang, bestConf, requiredConfidence, margin,
+              incumbentConf, false);
         return std::nullopt;
     }
 
@@ -721,6 +733,8 @@ std::optional<DetectionResult> TypoResilientDetect(
     if (!isFallback && bestLang != currentLang &&
         params.SwitchBiasMargin > 0.0f &&
         bestConf < incumbentConf + params.SwitchBiasMargin) {
+        trace("incumbent_gate", bestLang, bestConf, requiredConfidence, margin,
+              incumbentConf, lexSuppress);
         return std::nullopt;
     }
 
@@ -730,15 +744,18 @@ std::optional<DetectionResult> TypoResilientDetect(
     // ONNX scores → margin is meaningless, indicated by all-zero scores).
     if (!isFallback && !noScores && params.MinTop1Top2Margin > 0.0f &&
         margin < params.MinTop1Top2Margin) {
+        trace("margin_gate", bestLang, bestConf, requiredConfidence, margin,
+              incumbentConf, lexSuppress);
         return std::nullopt;
     }
 
     // --- Firing decision: stability gate AND confidence, OR a Hebrew
     //     weak-signal alternative (FN guard for flat-signal phrases) ---
     bool fire = false;
+    bool agreementOk = true;
     if (!isFallback) {
         // Tier 1: consecutive-agreement gate + adaptive confidence threshold.
-        bool agreementOk = !Config::EnableTypoResilience ||
+        agreementOk = !Config::EnableTypoResilience ||
                            history.IsConsistent(bestLang, params.ConsecutiveAgreementCount);
         if (agreementOk && bestConf >= requiredConfidence)
             fire = true;
@@ -767,6 +784,10 @@ std::optional<DetectionResult> TypoResilientDetect(
         fire = (bestConf >= requiredConfidence);
     }
 
+    trace(fire ? (bestLang == currentLang ? "stay" : "fired")
+               : (bestConf < requiredConfidence ? (lexSuppress ? "low_conf_triage_suppressed" : "low_conf")
+                                                : (agreementOk ? "low_conf" : "no_agreement")),
+          bestLang, bestConf, requiredConfidence, margin, incumbentConf, lexSuppress);
     if (fire) {
         DetectionResult result = bestFullResult;
         result.language = bestLang;

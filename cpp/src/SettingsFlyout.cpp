@@ -218,19 +218,19 @@ static Layout BuildLayout() {
         }
         y += 40;
         if (!missing.empty()) {
-            L.labels.push_back({missing + L": no keyboard layout installed.",
-                                {pad, y, pad + cw - 52, y + 18}, Font::Caption, false, true});
+            L.labels.push_back({missing + L": no layout installed",
+                                {pad, y, pad + cw - 160, y + 18}, Font::Caption, false, true});
         } else {
             L.labels.push_back({L"All supported layouts are installed.",
-                                {pad, y, pad + cw - 52, y + 18}, Font::Caption, false, true});
+                                {pad, y, pad + cw - 160, y + 18}, Font::Caption, false, true});
         }
         // Auto-exclude toggle sits at the right of that caption line.
-        L.labels.push_back({L"Skip missing", {pad, y + 20, pad + cw - 52, y + 38},
+        L.labels.push_back({L"Skip missing", {pad + cw - 150, y, pad + cw - 50, y + 18},
                             Font::Caption, false, true, DWRITE_TEXT_ALIGNMENT_TRAILING});
-        L.items.push_back({Kind::AutoExclude, 0, {pad + cw - 40, y + 19, pad + cw, y + 39}, true,
+        L.items.push_back({Kind::AutoExclude, 0, {pad + cw - 40, y - 1, pad + cw, y + 19}, true,
                            L"Automatically exclude languages whose keyboard layout is not installed "
                            L"(recommended). Turn off only if you add layouts on the fly."});
-        y += 48;
+        y += 30;
     }
 
     // ── Directions ──

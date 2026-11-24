@@ -145,6 +145,10 @@ static std::string DbgTimestamp() {
     return buf;
 }
 
+// Text + case-exclusion flag of the latest detection pass (FN-CONTEXT log).
+static std::wstring g_lastDetectText;
+static bool         g_lastCaseExcluded = false;
+
 static std::string ws2s(const std::wstring& w) {
     // Simple lossy conversion for logging.
     // Privacy: unless the user opted out of redaction, never write the
@@ -1805,8 +1809,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         if (!feedbackLogged) {
                             Feedback::RecordOutcome(windowLang, currentLayout,
                                                     Feedback::Outcome::FalseNegative);
-                            Dbg("CALIB: fn_manual_switch %s→%s",
-                                windowLang.c_str(), currentLayout.c_str());
+                            const DetectTrace& t = g_lastDetectTrace;
+                            Dbg("CALIB: fn_manual_switch %s→%s", windowLang.c_str(), currentLayout.c_str());
+                            Dbg("FN-CONTEXT: last=%s age=%lums best=%s conf=%.3f req=%.3f "
+                                "margin=%.3f incumbent=%.3f chars=%zu lexSuppress=%d caseExcl=%d text=%s",
+                                t.reason, t.tick ? (unsigned long)(GetTickCount() - t.tick) : 0UL,
+                                t.lang.c_str(), t.conf, t.required, t.margin, t.incumbent,
+                                t.numChars, (int)t.lexSuppress, (int)g_lastCaseExcluded,
+                                ws2s(g_lastDetectText).c_str());
                         }
 
                         // Expire any lingering grace period
@@ -1997,6 +2007,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
              detectionText.size() < static_cast<size_t>(Config::EarlyDetectionMinChars))) {
             shouldSkip = true;
             ++Config::Guards.skipLowAlpha;
+            g_lastDetectTrace = { "skip_low_alpha", "", 0, 0, 0, 0, alphaCount, false, GetTickCount() };
             Dbg("SKIP: skip_low_alpha (alpha=%zu detText=%zu minChars=%d)",
                 alphaCount, detectionText.size(), Config::EarlyDetectionMinChars);
         }
@@ -2005,6 +2016,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         // that the user disabled is never a source or a target.
         if (!shouldSkip && !LangAvail::IsLangUsable(currentLangId)) {
             shouldSkip = true;
+            g_lastDetectTrace = { "skip_lang_disabled", "", 0, 0, 0, 0, alphaCount, false, GetTickCount() };
             Dbg("SKIP: skip_lang_disabled (current=%s)", currentLangId.c_str());
         }
         const std::set<std::string> disabledTargets =
@@ -2112,6 +2124,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             // triggering key was already delivered and add one extra backspace
             // (bsCount = cacheLen instead of cacheLen-1).
 
+            g_lastDetectText   = text;
+            g_lastCaseExcluded = !caseExcludedLangs.empty();
             auto detection = TypoResilientDetect(
                 *g_detector, textVariants, currentLangId, alphaCount, g_history,
                 caseExcludedLangs, /*isFallback=*/false, disabledTargets);

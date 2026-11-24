@@ -159,6 +159,20 @@ std::optional<DetectionResult> TypoResilientDetect(
     bool isFallback = false,
     const std::set<std::string>& disabledLangs = {});
 
+// Outcome of the latest primary TypoResilientDetect() call (or the skip
+// reason set by the caller), so a manual switch (likely false negative)
+// can log why detection did not fire.  Main/hook thread only.
+struct DetectTrace {
+    const char* reason = "";       // fired / stay / low_conf / no_agreement /
+                                   // margin_gate / incumbent_gate / ...
+    std::string lang;              // best candidate
+    float conf = 0, required = 0, margin = 0, incumbent = 0;
+    size_t numChars = 0;
+    bool  lexSuppress = false;
+    unsigned long tick = 0;
+};
+extern DetectTrace g_lastDetectTrace;
+
 // Drop the softmax mass of |disabledLangs| and renormalise the remaining
 // classes; updates language/confidence to the new argmax.  Returns false
 // when N/A becomes the top class.  Mirrors _renormalise() in
