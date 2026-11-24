@@ -75,6 +75,7 @@ set(SOURCES
     src/Triage.cpp
     src/Security.cpp
     src/LangAvail.cpp
+    src/SettingsFlyout.cpp
 )
 
 set(HEADERS
@@ -87,6 +88,7 @@ set(HEADERS
     include/Triage.h
     include/Security.h
     include/LangAvail.h
+    include/SettingsFlyout.h
     resources/resource.h
 )
 
@@ -120,6 +122,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     shell32
     comctl32
     dwmapi
+    d2d1
+    dwrite
     winhttp
     oleacc
     ole32

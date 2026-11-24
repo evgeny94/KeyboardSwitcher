@@ -38,6 +38,7 @@
 #include "Triage.h"
 #include "Security.h"
 #include "LangAvail.h"
+#include "SettingsFlyout.h"
 #include "../resources/resource.h"
 
 // ============================================================
@@ -2460,403 +2461,6 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
 }
 
 // ============================================================
-// Detection Settings Flyout (left-click on tray icon)
-// ============================================================
-// Exposes per-direction detection parameters without a dialog:
-//   • Global short-text confidence  (ConfidenceAtMinChars, all directions)
-//   • Per-direction min chars       (EarlyDetectionMinChars, spin edit)
-//   • Per-direction confidence floor(ConfidenceAtMaxChars, slider)
-//
-// Layout (390 × 268 px):
-//   y=10   Global short-text confidence slider
-//   y=56   Separator
-//   y=64   Section header "Direction | Min | Confidence floor"
-//   y=84   EN→RU row … (6 rows, 22 px each)
-//   y=224  Separator
-//   y=234  Reset Defaults button
-// ============================================================
-
-static const wchar_t CONF_FLYOUT_CLASS[] = L"KS_ConfFlyout";
-static HWND g_hConfFlyout = nullptr;
-
-// Language-pair metadata (same order as Config::PairOverrides)
-static const char*    PAIR_FROM[6]  = {"en","ru","en","he","ru","he"};
-static const char*    PAIR_TO[6]    = {"ru","en","he","en","he","ru"};
-static const wchar_t* PAIR_LABEL[6] = {
-    L"EN\u2192RU",  L"RU\u2192EN",
-    L"EN\u2192HE",  L"HE\u2192EN",
-    L"RU\u2192HE",  L"HE\u2192RU",
-};
-
-// Factory defaults used by "Reset Defaults" (mirrors Config.cpp initial values)
-// Pair order: EN→RU(0), RU→EN(1), EN→HE(2), HE→EN(3), RU→HE(4), HE→RU(5)
-static constexpr float ORIG_GLOBAL_SHORT_CONF   = 0.99f;
-static constexpr int   ORIG_PAIR_MIN_CHARS[6]   = {4, 4, 3, 4, 3, 4};
-static constexpr float ORIG_PAIR_CONF_FLOOR[6]  = {0.70f, 0.70f, 0.60f, 0.70f, 0.60f, 0.70f};
-
-struct ConfFlyoutControls {
-    bool  initialized     = false;
-    HWND  hSliderGlobConf = nullptr;   // ConfidenceAtMinChars (all pairs)
-    HWND  hLabelGlobConf  = nullptr;   // value display
-    HWND  hEditMinChars[6]  = {};      // EarlyDetectionMinChars edit
-    HWND  hSpinMinChars[6]  = {};      // UpDown buddy
-    HWND  hSliderConf[6]    = {};      // ConfidenceAtMaxChars slider
-    HWND  hLabelConf[6]     = {};      // value display
-};
-static ConfFlyoutControls g_fly;
-
-// Format a slider position (50-100) as "0.xx" and set it on a STATIC control.
-static void UpdateConfLabel(HWND hLabel, int pos) {
-    wchar_t buf[16];
-    swprintf_s(buf, L"%.2f", pos / 100.0f);
-    SetWindowTextW(hLabel, buf);
-}
-
-// Sync the global early-out threshold (fast-path in the keyboard hook)
-// to the SMALLEST EarlyDetectionMinChars across all pair overrides.
-// Must be called at startup AND whenever a pair's min-chars changes,
-// otherwise low-min pairs (e.g. en→he EarlyMin=3) are blocked by the
-// stale global gate (DefaultParams=4) and never fire.
-static void SyncGlobalEarlyOut() {
-    int globalMin = 15;
-    for (const auto& [pair, params] : Config::PairOverrides)
-        globalMin = std::min(globalMin, params.EarlyDetectionMinChars);
-    Config::DefaultParams.EarlyDetectionMinChars = globalMin;
-}
-
-// Push all current control values into Config.
-static void ApplyAllFlyoutSettings() {
-    if (!g_fly.initialized) return;
-
-    // ── Global short-text confidence (all pairs) ──
-    if (g_fly.hSliderGlobConf) {
-        float gc = SendMessage(g_fly.hSliderGlobConf, TBM_GETPOS, 0, 0) / 100.0f;
-        Config::DefaultParams.ConfidenceAtMinChars = gc;
-        for (auto& [pair, params] : Config::PairOverrides)
-            params.ConfidenceAtMinChars = gc;
-    }
-
-    // ── Per-direction overrides ──
-    for (int i = 0; i < 6; ++i) {
-        Config::LangPair lp{PAIR_FROM[i], PAIR_TO[i]};
-        auto it = Config::PairOverrides.find(lp);
-        if (it == Config::PairOverrides.end()) continue;
-
-        // Min chars from spin/edit
-        if (g_fly.hSpinMinChars[i]) {
-            // UDM_GETPOS32's out-BOOL reports FAILURE: TRUE = the buddy held an
-            // invalid value, FALSE = the position was read successfully. (Do NOT
-            // treat it as a success flag — that inverts the test and clobbers
-            // every pair's min-chars to 1 on every apply.)
-            BOOL failed = FALSE;
-            int mc = static_cast<int>(
-                SendMessage(g_fly.hSpinMinChars[i], UDM_GETPOS32, 0, reinterpret_cast<LPARAM>(&failed)));
-            if (failed || mc < 1) mc = 1;
-            if (mc > 15)          mc = 15;
-            it->second.EarlyDetectionMinChars = mc;
-        }
-
-        // Confidence floor from slider → routed to the calibration controller
-        // as the USER BASE.  Effective = clamp(base + delta) is applied there,
-        // so manual edits and silent adaptation no longer clobber each other.
-        // Only write on an actual change to avoid creating trivial entries.
-        if (g_fly.hSliderConf[i]) {
-            float v = SendMessage(g_fly.hSliderConf[i], TBM_GETPOS, 0, 0) / 100.0f;
-            if (std::fabs(v - Feedback::GetBaseConfFloor(PAIR_FROM[i], PAIR_TO[i])) > 0.001f)
-                Feedback::SetBaseConfFloor(PAIR_FROM[i], PAIR_TO[i], v);
-        }
-    }
-
-    // Sync global early-out to the smallest pair value (fast-path in hook)
-    SyncGlobalEarlyOut();
-}
-
-static LRESULT CALLBACK ConfFlyoutWndProc(HWND hwnd, UINT msg,
-                                            WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE: {
-        HINSTANCE hInst = GetModuleHandle(nullptr);
-        HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-
-        // ── Column positions (client coords, 390 px wide) ──────────
-        const int pad       = 12;   // left / right margin
-        const int cw        = 366;  // usable content width (390 - 2*12)
-        // Per-direction row columns:
-        const int colLabel  = pad;          // direction label  x=12, w=58
-        const int colEdit   = pad + 60;     // min-chars edit   x=72, w=24
-        const int colSpin   = pad + 84;     // spin             x=96, w=16
-        const int colCh     = pad + 102;    // "ch" label       x=114, w=18
-        const int colSlider = pad + 124;    // conf-floor slider x=136, w=200
-        const int colValue  = pad + 326;    // value label      x=338, w=36
-        (void)colValue; // used via 'pad + cw - 36'
-
-        int y = 10;
-
-        // ── Global short-text confidence ───────────────────────────
-        {
-            HWND hS = CreateWindowExW(0, L"STATIC",
-                L"Short-text confidence (all directions):",
-                WS_CHILD | WS_VISIBLE, pad, y, cw - 44, 16,
-                hwnd, nullptr, hInst, nullptr);
-            SendMessage(hS, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-            g_fly.hLabelGlobConf = CreateWindowExW(0, L"STATIC", L"",
-                WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                pad + cw - 42, y, 42, 16,
-                hwnd, (HMENU)(INT_PTR)IDC_LABEL_MIN_CONF, hInst, nullptr);
-            SendMessage(g_fly.hLabelGlobConf, WM_SETFONT, (WPARAM)hFont, TRUE);
-        }
-        y += 18;
-        g_fly.hSliderGlobConf = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            pad, y, cw, 22,
-            hwnd, (HMENU)(INT_PTR)IDC_SLIDER_MIN_CONF, hInst, nullptr);
-        SendMessage(g_fly.hSliderGlobConf, TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
-        {
-            int iv = static_cast<int>(Config::DefaultParams.ConfidenceAtMinChars * 100.0f + 0.5f);
-            SendMessage(g_fly.hSliderGlobConf, TBM_SETPOS, TRUE, iv);
-            UpdateConfLabel(g_fly.hLabelGlobConf, iv);
-        }
-
-        // ── Separator ─────────────────────────────────────────────
-        y += 28;
-        CreateWindowExW(0, L"STATIC", nullptr,
-            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-            pad, y, cw, 2, hwnd, nullptr, hInst, nullptr);
-
-        // ── Section header ─────────────────────────────────────────
-        y += 8;
-        {
-            HWND hH1 = CreateWindowExW(0, L"STATIC",
-                L"Direction   Min",
-                WS_CHILD | WS_VISIBLE, pad, y, 140, 16,
-                hwnd, nullptr, hInst, nullptr);
-            SendMessage(hH1, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-            HWND hH2 = CreateWindowExW(0, L"STATIC",
-                L"Confidence floor",
-                WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                colSlider, y, cw - (colSlider - pad), 16,
-                hwnd, nullptr, hInst, nullptr);
-            SendMessage(hH2, WM_SETFONT, (WPARAM)hFont, TRUE);
-        }
-
-        // ── Per-direction rows ─────────────────────────────────────
-        y += 20;
-        for (int i = 0; i < 6; ++i) {
-            int ry = y + i * 22;
-
-            // Direction label  ("EN→RU")
-            {
-                HWND hLbl = CreateWindowExW(0, L"STATIC", PAIR_LABEL[i],
-                    WS_CHILD | WS_VISIBLE, colLabel, ry + 2, 58, 16,
-                    hwnd, nullptr, hInst, nullptr);
-                SendMessage(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
-            }
-
-            // Min-chars edit (WS_EX_CLIENTEDGE gives the sunken border)
-            g_fly.hEditMinChars[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
-                colEdit, ry, 24, 18,
-                hwnd, (HMENU)(INT_PTR)(IDC_EDIT_PAIR_BASE + i), hInst, nullptr);
-            SendMessage(g_fly.hEditMinChars[i], WM_SETFONT, (WPARAM)hFont, TRUE);
-
-            // Spin buddy — NO UDS_AUTOBUDDY so we control positioning precisely
-            g_fly.hSpinMinChars[i] = CreateWindowExW(0, UPDOWN_CLASSW, nullptr,
-                WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_HOTTRACK,
-                colSpin, ry, 14, 18,
-                hwnd, (HMENU)(INT_PTR)(IDC_SPIN_PAIR_BASE + i), hInst, nullptr);
-            SendMessage(g_fly.hSpinMinChars[i], UDM_SETBUDDY,
-                        (WPARAM)g_fly.hEditMinChars[i], 0);
-            SendMessage(g_fly.hSpinMinChars[i], UDM_SETRANGE32, 1, 15);
-            {
-                auto it = Config::PairOverrides.find({PAIR_FROM[i], PAIR_TO[i]});
-                int initMC = (it != Config::PairOverrides.end())
-                             ? it->second.EarlyDetectionMinChars : 4;
-                SendMessage(g_fly.hSpinMinChars[i], UDM_SETPOS32, 0, initMC);
-            }
-
-            // "ch" label
-            {
-                HWND hCh = CreateWindowExW(0, L"STATIC", L"ch",
-                    WS_CHILD | WS_VISIBLE, colCh, ry + 2, 18, 16,
-                    hwnd, nullptr, hInst, nullptr);
-                SendMessage(hCh, WM_SETFONT, (WPARAM)hFont, TRUE);
-            }
-
-            // Confidence-floor slider
-            g_fly.hSliderConf[i] = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
-                WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-                colSlider, ry, 200, 22,
-                hwnd, (HMENU)(INT_PTR)(IDC_SLIDER_PAIR_BASE + i), hInst, nullptr);
-            SendMessage(g_fly.hSliderConf[i], TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
-            {
-                // Show the USER BASE floor, not the effective value: the
-                // invisible calibration delta must stay hidden from the UI.
-                float cf = Feedback::GetBaseConfFloor(PAIR_FROM[i], PAIR_TO[i]);
-                int iv = static_cast<int>(cf * 100.0f + 0.5f);
-                SendMessage(g_fly.hSliderConf[i], TBM_SETPOS, TRUE, iv);
-
-                // Value label
-                g_fly.hLabelConf[i] = CreateWindowExW(0, L"STATIC", L"",
-                    WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                    pad + cw - 36, ry + 2, 36, 16,
-                    hwnd, (HMENU)(INT_PTR)(IDC_LABEL_PAIR_BASE + i), hInst, nullptr);
-                SendMessage(g_fly.hLabelConf[i], WM_SETFONT, (WPARAM)hFont, TRUE);
-                UpdateConfLabel(g_fly.hLabelConf[i], iv);
-            }
-        }
-
-        // ── Bottom separator ──────────────────────────────────────
-        y += 6 * 22 + 8;
-        CreateWindowExW(0, L"STATIC", nullptr,
-            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-            pad, y, cw, 2, hwnd, nullptr, hInst, nullptr);
-
-        // ── Reset Defaults button ─────────────────────────────────
-        y += 10;
-        {
-            HWND hReset = CreateWindowExW(0, L"BUTTON", L"Reset Defaults",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                (390 - 120) / 2, y, 120, 26,
-                hwnd, (HMENU)(INT_PTR)IDC_BTN_RESET, hInst, nullptr);
-            SendMessage(hReset, WM_SETFONT, (WPARAM)hFont, TRUE);
-        }
-
-        g_fly.initialized = true;
-        return 0;
-    }
-
-    case WM_HSCROLL: {
-        // Trackbar moved
-        HWND hCtrl = reinterpret_cast<HWND>(lParam);
-        if (hCtrl == g_fly.hSliderGlobConf) {
-            UpdateConfLabel(g_fly.hLabelGlobConf,
-                static_cast<int>(SendMessage(g_fly.hSliderGlobConf, TBM_GETPOS, 0, 0)));
-        } else {
-            for (int i = 0; i < 6; ++i) {
-                if (hCtrl == g_fly.hSliderConf[i]) {
-                    UpdateConfLabel(g_fly.hLabelConf[i],
-                        static_cast<int>(SendMessage(g_fly.hSliderConf[i], TBM_GETPOS, 0, 0)));
-                    break;
-                }
-            }
-        }
-        ApplyAllFlyoutSettings();
-        return 0;
-    }
-
-    case WM_NOTIFY: {
-        // UpDown spin clicked → UDM_SETPOS32 fires EN_CHANGE on the buddy
-        // edit, which triggers WM_COMMAND below.  Nothing extra needed here.
-        return 0;
-    }
-
-    case WM_COMMAND: {
-        WORD ctrl  = LOWORD(wParam);
-        WORD notif = HIWORD(wParam);
-
-        if (ctrl == IDC_BTN_RESET) {
-            // Restore factory defaults
-            int defGC = static_cast<int>(ORIG_GLOBAL_SHORT_CONF * 100.0f + 0.5f);
-            SendMessage(g_fly.hSliderGlobConf, TBM_SETPOS, TRUE, defGC);
-            UpdateConfLabel(g_fly.hLabelGlobConf, defGC);
-
-            for (int i = 0; i < 6; ++i) {
-                SendMessage(g_fly.hSpinMinChars[i], UDM_SETPOS32, 0, ORIG_PAIR_MIN_CHARS[i]);
-                int defCF = static_cast<int>(ORIG_PAIR_CONF_FLOOR[i] * 100.0f + 0.5f);
-                SendMessage(g_fly.hSliderConf[i], TBM_SETPOS, TRUE, defCF);
-                UpdateConfLabel(g_fly.hLabelConf[i], defCF);
-                // Full per-pair factory reset: base → factory AND wipe any
-                // invisible calibration delta, so "Reset Defaults" is a true
-                // factory reset of the detection threshold.
-                Feedback::ResetPairToFactory(PAIR_FROM[i], PAIR_TO[i],
-                                             ORIG_PAIR_CONF_FLOOR[i]);
-            }
-            ApplyAllFlyoutSettings();
-            Feedback::SavePrefs();   // persist the cleared calibration state
-            return 0;
-        }
-
-        // EN_CHANGE from any min-chars edit (also fired by spin arrows via
-        // UDS_SETBUDDYINT) → re-apply
-        if (notif == EN_CHANGE) {
-            for (int i = 0; i < 6; ++i) {
-                if (ctrl == (WORD)(IDC_EDIT_PAIR_BASE + i)) {
-                    ApplyAllFlyoutSettings();
-                    break;
-                }
-            }
-        }
-        return 0;
-    }
-
-    case WM_ACTIVATE:
-        // Auto-dismiss on focus loss
-        if (LOWORD(wParam) == WA_INACTIVE)
-            DestroyWindow(hwnd);
-        return 0;
-
-    case WM_DESTROY:
-        // Persist any user-base floor edits made via the sliders (SetBaseConfFloor
-        // batches writes to here so a drag does not hit the disk every tick).
-        Feedback::SavePrefs();
-        g_hConfFlyout = nullptr;
-        g_fly = {};
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
-
-static void ShowConfidenceFlyout() {
-    // Toggle: if already open, close it
-    if (g_hConfFlyout) {
-        DestroyWindow(g_hConfFlyout);
-        return;
-    }
-
-    HINSTANCE hInst = GetModuleHandle(nullptr);
-    static bool classRegistered = false;
-    if (!classRegistered) {
-        WNDCLASSEXW wc = {};
-        wc.cbSize        = sizeof(wc);
-        wc.lpfnWndProc   = ConfFlyoutWndProc;
-        wc.hInstance      = hInst;
-        wc.hbrBackground  = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-        wc.lpszClassName  = CONF_FLYOUT_CLASS;
-        wc.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassExW(&wc);
-        classRegistered = true;
-    }
-
-    // Window size: 390 wide, 268 tall (see layout comment above)
-    const int w = 390, h = 268;
-
-    POINT pt;
-    GetCursorPos(&pt);
-    int x = pt.x - w / 2;
-    int y = pt.y - h - 4;
-
-    // Clamp to the work area so the flyout never goes off-screen
-    RECT wa;
-    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
-    if (x < wa.left)       x = wa.left;
-    if (x + w > wa.right)  x = wa.right - w;
-    if (y < wa.top)        y = wa.top;
-    if (y + h > wa.bottom) y = wa.bottom - h;
-
-    g_hConfFlyout = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        CONF_FLYOUT_CLASS, nullptr,
-        WS_POPUP | WS_BORDER,
-        x, y, w, h,
-        g_hwndHidden, nullptr, hInst, nullptr);
-
-    ShowWindow(g_hConfFlyout, SW_SHOW);
-    SetForegroundWindow(g_hConfFlyout);
-}
-
-// ============================================================
 // Hidden window procedure (tray icon messages + context menu)
 // ============================================================
 static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2864,7 +2468,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_TRAYICON:
         // Left-click: toggle confidence flyout
         if (lParam == WM_LBUTTONUP) {
-            ShowConfidenceFlyout();
+            SettingsFlyout::Toggle(hwnd);
         }
         // Right-click: context menu
         else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
@@ -3053,9 +2657,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     if (lpCmdLine && strstr(lpCmdLine, "--debug-log")) DbgSetEnabled(true);
     Dbg("=== KeyboardSwitcher started ===");
 
-    // ---- Common controls (trackbar + updown spin for the settings flyout) ----
-    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES | ICC_UPDOWN_CLASS };
+    // ---- Common controls (tooltips in the settings flyout) ----
+    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
     InitCommonControlsEx(&icex);
+
+    // ---- Developer / CI: render or show the settings flyout and exit ----
+    //   --render-flyout <out.bmp> [--theme dark] [--scale 1.5] [--assume-installed en,he]
+    //   --flyout-demo [--assume-installed en,he]
+    // Runs before the single-instance guard and never persists changes.
+    if (lpCmdLine && (strstr(lpCmdLine, "--render-flyout") || strstr(lpCmdLine, "--flyout-demo"))) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        std::wstring out;
+        bool dark = false, demo = false;
+        float scale = 1.0f;
+        for (int i = 1; argv && i < argc; ++i) {
+            std::wstring a = argv[i];
+            std::wstring next = (i + 1 < argc) ? argv[i + 1] : L"";
+            if (a == L"--render-flyout") { out = next; ++i; }
+            else if (a == L"--flyout-demo") demo = true;
+            else if (a == L"--theme") { dark = (next == L"dark"); ++i; }
+            else if (a == L"--scale") { scale = static_cast<float>(_wtof(next.c_str())); ++i; }
+            else if (a == L"--assume-installed") {
+                unsigned mask = 0;
+                for (int l = 0; l < LangAvail::kNumLangs; ++l) {
+                    std::wstring code(LangAvail::kLangs[l], LangAvail::kLangs[l] + 2);
+                    if (next.find(code) != std::wstring::npos) mask |= 1u << l;
+                }
+                LangAvail::OverrideInstalled(mask);
+                ++i;
+            }
+        }
+        if (argv) LocalFree(argv);
+        if (scale < 0.5f || scale > 4.0f) scale = 1.0f;
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        Feedback::Init();          // read-only here: shows the user's base floors
+        SettingsFlyout::SyncGlobalEarlyOut();
+        if (demo) { SettingsFlyout::RunDemo(); return 0; }
+        return (!out.empty() && SettingsFlyout::RenderToBitmapFile(out, dark, scale)) ? 0 : 1;
+    }
 
     // COM (apartment-threaded) for MSAA password-field detection
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -3098,7 +2738,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     // Sync the global early-out gate to the smallest per-pair EarlyMin so
     // that low-min pairs (en→he / ru→he = 3) can fire at 3 alpha chars on
     // a fresh launch — not only after the settings flyout is applied.
-    SyncGlobalEarlyOut();
+    SettingsFlyout::SyncGlobalEarlyOut();
 
     // Initialize the window tracker (no default language — each window
     // is unvisited until the user first interacts with it)

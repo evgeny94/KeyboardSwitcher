@@ -51,6 +51,33 @@ jobs:
           cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j $env:NUMBER_OF_PROCESSORS
 
+      - name: Render settings flyout previews
+        shell: pwsh
+        working-directory: cpp/build
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          New-Item -ItemType Directory -Force preview | Out-Null
+          $cases = @(
+            @{ n = "light-en-he";    t = "light"; l = "en,he" },
+            @{ n = "dark-en-he";     t = "dark";  l = "en,he" },
+            @{ n = "light-en-he-ru"; t = "light"; l = "en,he,ru" },
+            @{ n = "dark-en";        t = "dark";  l = "en" }
+          )
+          foreach ($c in $cases) {
+            $bmp = "$PWD\preview\$($c.n).bmp"
+            $p = Start-Process .\KeyboardSwitcher.exe -Wait -PassThru -ArgumentList @(
+              "--render-flyout", "`"$bmp`"", "--theme", $c.t, "--scale", "1.5", "--assume-installed", $c.l)
+            if ($p.ExitCode -ne 0) { throw "flyout render failed for $($c.n): $($p.ExitCode)" }
+            $img = [System.Drawing.Image]::FromFile($bmp)
+            $img.Save("$PWD\preview\$($c.n).png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $img.Dispose(); Remove-Item $bmp
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flyout-preview
+          path: cpp/build/preview/*.png
+
       - name: Package (ZIP + NSIS installer)
         shell: pwsh
         working-directory: cpp/build

@@ -33,6 +33,7 @@ static std::vector<HKL> InstalledLayouts() {
 }
 
 void Refresh() {
+    if (g_frozen.load()) return;
     unsigned mask = 0;
     for (HKL h : InstalledLayouts()) {
         WORD prim = PRIMARYLANGID(LOWORD(reinterpret_cast<DWORD_PTR>(h)));
@@ -45,7 +46,15 @@ void Refresh() {
     g_refreshed.store(true);
 }
 
+static std::atomic<bool> g_frozen{false};
+
+void OverrideInstalled(unsigned mask) {
+    g_installed.store(mask);
+    g_frozen.store(true);
+}
+
 static void MaybeRefresh() {
+    if (g_frozen.load()) return;
     if (!g_refreshed.load() || GetTickCount() - g_lastRefresh.load() > 2000)
         Refresh();
 }

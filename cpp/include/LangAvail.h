@@ -41,6 +41,10 @@ namespace LangAvail {
     void Refresh();
 
     bool IsInstalled(const std::string& lang);
+
+    // Preview / tests only: pretend exactly |mask| (bit i = kLangs[i]) is
+    // installed and stop refreshing from the system.
+    void OverrideInstalled(unsigned mask);
     bool IsLangUsable(const std::string& lang);
     bool IsDirectionUsable(const std::string& from, const std::string& to);
 
