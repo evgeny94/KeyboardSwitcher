@@ -246,6 +246,34 @@ set(KS_NSIS_CLOSE_APP
 set(CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}")
 set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}")
 
+# Finish page: "Start Keyboard Switcher now" (checked) and "Turn on the
+# debug log" (unchecked).  The app is started through explorer.exe so it
+# runs un-elevated as the user, not with the installer's admin rights
+# (8.3 short path: no quotes needed through CPack's escaping).
+# The debug choice is handed over through HKCU (read once and deleted by
+# the app at startup, then remembered in settings.json).
+# MUI processes the RUN checkbox before the README one, so RUN carries the
+# debug flag and README starts the app.
+set(CPACK_NSIS_DEFINES "
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_NOTCHECKED
+!define MUI_FINISHPAGE_RUN_TEXT 'Turn on the debug log (troubleshooting)'
+!define MUI_FINISHPAGE_RUN_FUNCTION ksFinishDebugLog
+!define MUI_FINISHPAGE_SHOWREADME
+!define MUI_FINISHPAGE_SHOWREADME_TEXT 'Start Keyboard Switcher now'
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION ksFinishStart
+Function ksFinishDebugLog
+  WriteRegDWORD HKCU 'Software\\\\KeyboardSwitcher' 'EnableDebugLog' 1
+FunctionEnd
+Function ksFinishStart
+  GetFullPathName /SHORT $0 '$INSTDIR\\\\KeyboardSwitcher.exe'
+  StrCmp $0 '' 0 +3
+    ExecShell 'open' '$INSTDIR\\\\KeyboardSwitcher.exe'
+    Return
+  Exec '$WINDIR\\\\explorer.exe $0'
+FunctionEnd
+")
+
 # Start-menu shortcut
 set(CPACK_NSIS_CREATE_ICONS_EXTRA
     "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Keyboard Switcher.lnk' '$INSTDIR\\\\KeyboardSwitcher.exe'")

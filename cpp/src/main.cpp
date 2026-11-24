@@ -2796,6 +2796,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     // turning either off in the tray menu saves "off".
     {
         bool changed = false;
+        // One-shot request from the installer's finish page (HKCU value,
+        // deleted after reading).
+        DWORD fromInstaller = 0, sz = sizeof(fromInstaller);
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\KeyboardSwitcher", L"EnableDebugLog",
+                         RRF_RT_REG_DWORD, nullptr, &fromInstaller, &sz) == ERROR_SUCCESS) {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\KeyboardSwitcher", L"EnableDebugLog");
+            if (fromInstaller) {
+                Security::DebugLogOnStartup.store(true);
+                changed = true;
+            }
+        }
         if (g_debugLogEnabled && !Security::DebugLogOnStartup.load()) {
             Security::DebugLogOnStartup.store(true); changed = true;
         }

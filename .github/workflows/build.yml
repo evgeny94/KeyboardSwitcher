@@ -95,6 +95,10 @@ jobs:
           if (-not (Select-String -Path $nsi.FullName -Pattern 'taskkill.exe /F /IM KeyboardSwitcher.exe' -Quiet)) {
             throw "installer is missing the close-running-app step"
           }
+          if (-not (Select-String -Path $nsi.FullName -Pattern 'ksFinishStart' -Quiet)) {
+            throw "installer is missing the finish-page start option"
+          }
+          Select-String -Path $nsi.FullName -Pattern 'ksFinish|explorer.exe|EnableDebugLog' | ForEach-Object { $_.Line.Trim() }
 
       - uses: actions/upload-artifact@v4
         with:

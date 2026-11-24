@@ -90,12 +90,22 @@ static UINT32 AccentRgb(bool dark) {
     return dark ? 0x60CDFF : 0x005FB8;
 }
 
+// Mix |rgb| towards |base| (amount = share of rgb).
+static UINT32 Blend(UINT32 base, UINT32 rgb, float amount) {
+    auto ch = [&](int sh) {
+        float b = (base >> sh) & 0xFF, c = (rgb >> sh) & 0xFF;
+        return static_cast<UINT32>(b + (c - b) * amount + 0.5f) << sh;
+    };
+    return ch(16) | ch(8) | ch(0);
+}
+
 static Theme MakeTheme(bool dark) {
     Theme t;
     t.dark = dark;
-    t.accent = Rgb(AccentRgb(dark));
+    const UINT32 accent = AccentRgb(dark);
+    t.accent = Rgb(accent);
     if (dark) {
-        t.bg         = Rgb(0x1C1C1C);
+        t.bg         = Rgb(Blend(0x1A1A1A, accent, 0.07f));   // accent-tinted, not flat grey
         t.card       = Rgb(0x2B2B2B);
         t.cardStroke = Rgb(0xFFFFFF, 0.08f);
         t.text       = Rgb(0xFFFFFF);
@@ -109,7 +119,7 @@ static Theme MakeTheme(bool dark) {
         t.thumb      = Rgb(0x454545);
         t.track      = Rgb(0xFFFFFF, 0.54f);
     } else {
-        t.bg         = Rgb(0xEEEEEE);
+        t.bg         = Rgb(Blend(0xF7F7F7, accent, 0.08f));   // accent-tinted, not flat grey
         t.card       = Rgb(0xFFFFFF);
         t.cardStroke = Rgb(0x000000, 0.08f);
         t.text       = Rgb(0x000000, 0.90f);
