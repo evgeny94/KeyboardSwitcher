@@ -1,0 +1,74 @@
+# Reproducible public build: anyone can see exactly which source
+# produced the installer, and compare SHA-256 with release assets.
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ORT_VERSION: "1.24.3"
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch ONNX Runtime ${{ env.ORT_VERSION }} (official Microsoft release)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/onnxruntime-win-x64-$env:ORT_VERSION.zip"
+          Invoke-WebRequest $url -OutFile ort.zip
+          Write-Host "ORT zip SHA-256: $((Get-FileHash ort.zip).Hash)"
+          Expand-Archive ort.zip -DestinationPath ort
+          $root = Get-ChildItem ort -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force cpp/onnxruntime/lib | Out-Null
+          Copy-Item "$($root.FullName)/lib/*" cpp/onnxruntime/lib/ -Recurse -Force
+          # Refuse to ship an onnxruntime.dll that is not Microsoft-signed
+          $sig = Get-AuthenticodeSignature cpp/onnxruntime/lib/onnxruntime.dll
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "onnxruntime.dll signature check failed: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+
+      - name: Ensure NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) {
+            choco install nsis -y --no-progress
+          }
+
+      - name: Configure & build (MinGW)
+        shell: pwsh
+        working-directory: cpp
+        run: |
+          cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Package (ZIP + NSIS installer)
+        shell: pwsh
+        working-directory: cpp/build
+        run: |
+          $nsis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $nsis) { $nsis = "C:\Program Files (x86)\NSIS\makensis.exe" }
+          cpack -G ZIP
+          cpack -G NSIS -D "CPACK_NSIS_MAKENSIS_EXECUTABLE=$nsis"
+          Get-ChildItem KeyboardSwitcher-*-win64.* | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Tee-Object -FilePath SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeyboardSwitcher-win64
+          path: |
+            cpp/build/KeyboardSwitcher-*-win64.exe
+            cpp/build/KeyboardSwitcher-*-win64.zip
+            cpp/build/SHA256SUMS.txt
+          if-no-files-found: error

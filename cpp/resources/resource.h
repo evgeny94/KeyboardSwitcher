@@ -13,6 +13,9 @@
 #define ID_TRAY_COLLECT_FEEDBACK 1008
 #define ID_TRAY_OPEN_FEEDBACK    1009
 #define ID_TRAY_RESET_LEARNING   1010
+#define ID_TRAY_PROTECT_SECURE   1011
+#define ID_TRAY_REDACT_DEBUG     1012
+#define ID_TRAY_STARTUP_UPDATE   1013
 
 // Detection-settings flyout control IDs
 #define IDC_SLIDER_MIN_CONF   2001   // global short-text confidence slider

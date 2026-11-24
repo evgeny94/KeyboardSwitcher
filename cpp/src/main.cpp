@@ -35,6 +35,7 @@
 #include "TrayIcon.h"
 #include "FeedbackLogger.h"
 #include "Triage.h"
+#include "Security.h"
 #include "../resources/resource.h"
 
 // ============================================================
@@ -125,7 +126,12 @@ static std::string DbgTimestamp() {
 }
 
 static std::string ws2s(const std::wstring& w) {
-    // Simple lossy conversion for logging
+    // Simple lossy conversion for logging.
+    // Privacy: unless the user opted out of redaction, never write the
+    // typed text itself to the debug log — only its length.
+    if (Security::RedactDebugLog.load()) {
+        return "<len=" + std::to_string(w.size()) + ">";
+    }
     std::string s;
     for (wchar_t c : w) {
         if (c < 128) s += (char)c;
@@ -157,6 +163,7 @@ static void Dbg(const char* fmt, ...) {
 struct UpdateInfo {
     std::string version;      // latest version string (e.g. "1.3.0")
     std::string downloadUrl;  // browser_download_url for the .exe asset
+    std::string sha256;       // lowercase hex from the asset's "digest" field
 };
 static UpdateInfo  g_updateInfo;
 static bool        g_updateCheckManual = false;
@@ -205,7 +212,7 @@ static bool WinHttpGet(const std::wstring& host,
     }
 
     // Allow automatic redirects (WinHTTP follows them by default)
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY,
                      &redirectPolicy, sizeof(redirectPolicy));
 
@@ -291,6 +298,13 @@ static bool FetchLatestReleaseInfo(UpdateInfo& info) {
                     name.substr(name.size() - 4) == ".exe") {
                     info.downloadUrl = asset.value(
                         "browser_download_url", "");
+                    // GitHub publishes "digest": "sha256:<hex>" per asset.
+                    std::string digest = asset.value("digest", "");
+                    if (digest.rfind("sha256:", 0) == 0) {
+                        info.sha256 = digest.substr(7);
+                        std::transform(info.sha256.begin(), info.sha256.end(),
+                                       info.sha256.begin(), ::tolower);
+                    }
                     break;
                 }
             }
@@ -343,6 +357,11 @@ static bool DownloadFileTo(const std::string& url,
     bool secure = true;
     if (!CrackUrl(url, host, path, secure))
         return false;
+    // Hardening: HTTPS only, and only to known GitHub hosts.
+    if (!secure || !Security::IsAllowedUpdateHost(host)) {
+        Dbg("UPDATE: refused download URL (host not allowed or not HTTPS)");
+        return false;
+    }
 
     HINTERNET hSession = WinHttpOpen(
         L"KeyboardSwitcher-UpdateCheck/1.0",
@@ -366,7 +385,7 @@ static bool DownloadFileTo(const std::string& url,
         return false;
     }
 
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY,
                      &redirectPolicy, sizeof(redirectPolicy));
 
@@ -386,6 +405,44 @@ static bool DownloadFileTo(const std::string& url,
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
         return false;
+    }
+
+    // Hardening: require HTTP 200 and verify the post-redirect host is
+    // still a GitHub download host (blocks redirects to arbitrary sites).
+    {
+        DWORD statusCode = 0, statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize,
+            WINHTTP_NO_HEADER_INDEX);
+
+        bool finalOk = false;
+        DWORD urlLen = 0;
+        WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, nullptr, &urlLen);
+        if (urlLen > 0) {
+            std::vector<wchar_t> urlBuf(urlLen / sizeof(wchar_t) + 1, 0);
+            if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL,
+                                   urlBuf.data(), &urlLen)) {
+                // Host-only crack (signed asset URLs can have very long
+                // paths/queries, so don't copy them into fixed buffers).
+                URL_COMPONENTS fu = {};
+                fu.dwStructSize     = sizeof(fu);
+                fu.dwHostNameLength = (DWORD)-1;
+                if (WinHttpCrackUrl(urlBuf.data(), 0, 0, &fu) &&
+                    fu.lpszHostName && fu.nScheme == INTERNET_SCHEME_HTTPS) {
+                    std::wstring fHost(fu.lpszHostName, fu.dwHostNameLength);
+                    finalOk = Security::IsAllowedUpdateHost(fHost);
+                }
+            }
+        }
+        if (statusCode != 200 || !finalOk) {
+            Dbg("UPDATE: refused download (status=%lu finalHostOk=%d)",
+                statusCode, finalOk ? 1 : 0);
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
     }
 
     // Open local file
@@ -469,6 +526,25 @@ static void DownloadUpdateAsync() {
         dest += L"-win64.exe";
 
         bool ok = DownloadFileTo(g_updateInfo.downloadUrl, dest);
+
+        // Hardening: verify SHA-256 against the digest GitHub publishes
+        // for the release asset.  A missing digest is treated as a
+        // failure unless the user explicitly disabled verification in
+        // settings.json ("require_verified_updates": false).
+        if (ok) {
+            const std::string& expected = g_updateInfo.sha256;
+            if (!expected.empty()) {
+                std::string actual = Security::Sha256File(dest);
+                if (actual != expected) {
+                    Dbg("UPDATE: SHA-256 mismatch — installer discarded");
+                    ok = false;
+                }
+            } else if (Security::RequireVerifiedUpdates.load()) {
+                Dbg("UPDATE: no SHA-256 digest published — installer discarded");
+                ok = false;
+            }
+            if (!ok) DeleteFileW(dest.c_str());
+        }
         g_downloadedInstallerPath = ok ? dest : L"";
         if (g_hwndHidden)
             PostMessage(g_hwndHidden, WM_UPDATE_DOWNLOAD_DONE, 0, 0);
@@ -526,7 +602,8 @@ static void HandleUpdateCheckResult() {
 static void HandleUpdateDownloadDone() {
     if (g_downloadedInstallerPath.empty()) {
         MessageBoxW(nullptr,
-            L"Download failed.\n"
+            L"Download failed or the installer could not be verified\n"
+            L"(SHA-256 / host check).\n"
             L"Please download the update manually from:\n"
             L"https://github.com/kertser/KeyboardSwitcher/releases/latest",
             L"Keyboard Switcher \x2014 Update",
@@ -573,6 +650,7 @@ static std::atomic<bool>   g_isSendingInput{false}; // re-entrancy guard
 static HWND          g_lastForegroundHwnd = nullptr;
 static size_t        g_lastContextHash    = 0;
 static HWINEVENTHOOK g_winEventHook       = nullptr;
+static HWINEVENTHOOK g_focusEventHook     = nullptr;
 
 // Post-correction grace period: suppress false manual-switch detection
 // when the target window (e.g. a file dialog) reverts our layout change.
@@ -1136,10 +1214,16 @@ static void HandleFocusChange(bool forceSearch = false) {
 // delivered on the message-loop thread via the message pump.
 static void CALLBACK WinEventProc(
     HWINEVENTHOOK /*hWinEventHook*/, DWORD event,
-    HWND /*hwnd*/, LONG /*idObject*/, LONG /*idChild*/,
+    HWND hwnd, LONG idObject, LONG idChild,
     DWORD /*dwEventThread*/, DWORD /*dwmsEventTime*/)
 {
+    if (event == EVENT_OBJECT_FOCUS) {
+        // Track whether keyboard focus is on a password field.
+        Security::OnFocusEvent(hwnd, idObject, idChild);
+        return;
+    }
     if (event == EVENT_SYSTEM_FOREGROUND) {
+        Security::OnFocusEvent(nullptr, 0, 0);
         if (!Config::EnableSwitcher.load()) return;
         HandleFocusChange();
     }
@@ -1390,6 +1474,17 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
 
     DWORD vk = pKb->vkCode;
+
+    // --- Privacy: password / protected fields ---
+    // Never buffer, analyse, log or retype keystrokes while focus is
+    // on a password field.  Drop any partial word and pass the key on.
+    if (Security::ProtectSecureFields.load() &&
+        Security::SecureFieldFocused.load()) {
+        if (g_cache.Size() > 0) g_cache.Clear();
+        g_history.Clear();
+        g_lastCorrection.valid = false;
+        return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+    }
 
     // --- Esc to undo the last correction ---
     if (vk == VK_ESCAPE && g_lastCorrection.valid) {
@@ -2757,6 +2852,22 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     MF_STRING | (Feedback::LoggingEnabled.load() ? MF_CHECKED : MF_UNCHECKED),
                     ID_TRAY_COLLECT_FEEDBACK, L"Collect Feedback");
 
+                // Privacy & Security submenu (secure defaults; power
+                // users can relax them here or in settings.json).
+                HMENU hSec = CreatePopupMenu();
+                if (hSec) {
+                    AppendMenuW(hSec,
+                        MF_STRING | (Security::ProtectSecureFields.load() ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_PROTECT_SECURE, L"Ignore password fields");
+                    AppendMenuW(hSec,
+                        MF_STRING | (Security::RedactDebugLog.load() ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_REDACT_DEBUG, L"Hide typed text in debug log");
+                    AppendMenuW(hSec,
+                        MF_STRING | (Security::CheckUpdatesOnStartup.load() ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_STARTUP_UPDATE, L"Check for updates on startup");
+                    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSec, L"Privacy && Security");
+                }
+
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_FEEDBACK,
                     L"Open Feedback Folder\x2026");
@@ -2810,6 +2921,28 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_COLLECT_FEEDBACK:
             Feedback::SetLoggingEnabled(!Feedback::LoggingEnabled.load());
+            break;
+        case ID_TRAY_PROTECT_SECURE:
+            if (Security::ProtectSecureFields.load()) {
+                if (MessageBoxW(nullptr,
+                        L"Turn off password-field protection?\n\n"
+                        L"Keystrokes typed into password fields will then be "
+                        L"analysed (in memory) like any other text.",
+                        L"Keyboard Switcher",
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+                    break;
+            }
+            Security::ProtectSecureFields.store(!Security::ProtectSecureFields.load());
+            Security::OnFocusEvent(nullptr, 0, 0);
+            Security::SaveSettings();
+            break;
+        case ID_TRAY_REDACT_DEBUG:
+            Security::RedactDebugLog.store(!Security::RedactDebugLog.load());
+            Security::SaveSettings();
+            break;
+        case ID_TRAY_STARTUP_UPDATE:
+            Security::CheckUpdatesOnStartup.store(!Security::CheckUpdatesOnStartup.load());
+            Security::SaveSettings();
             break;
         case ID_TRAY_OPEN_FEEDBACK: {
             std::wstring dir = Feedback::GetDataDir();
@@ -2872,6 +3005,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES | ICC_UPDOWN_CLASS };
     InitCommonControlsEx(&icex);
 
+    // COM (apartment-threaded) for MSAA password-field detection
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     // ---- Single-instance guard (named mutex) ----
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\KeyboardSwitcher_SingleInstance");
     if (hMutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2921,6 +3057,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // Initialize feedback logger (loads persisted thresholds & preferences)
     Feedback::Init();
+
+    // Privacy / security settings (settings.json; secure defaults)
+    Security::LoadSettings();
 
     // Seed focus-tracking globals so the first keystroke doesn't
     // trigger a spurious HandleFocusChange.
@@ -2988,9 +3127,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         nullptr, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
+    // Focus changes inside windows (e.g. tabbing into a password box)
+    // drive the secure-field guard.
+    g_focusEventHook = SetWinEventHook(
+        EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
+        nullptr, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    Security::OnFocusEvent(nullptr, 0, 0);
+
     // Check for updates in the background (3-second delay so the app
     // starts up smoothly; silent if already on the latest version).
-    CheckForUpdatesAsync(false, 3);
+    if (Security::CheckUpdatesOnStartup.load())
+        CheckForUpdatesAsync(false, 3);
 
     // Message loop (required for low-level hooks to work)
     MSG msg;
@@ -3001,6 +3149,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // Cleanup
     if (g_winEventHook) UnhookWinEvent(g_winEventHook);
+    if (g_focusEventHook) UnhookWinEvent(g_focusEventHook);
+    CoUninitialize();
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     if (g_mouseHook)    UnhookWindowsHookEx(g_mouseHook);
     if (g_iconRed)   DestroyIcon(g_iconRed);

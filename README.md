@@ -13,6 +13,7 @@ Automatically detect and switch the keyboard language (**En ↔ He ↔ Ru**) on 
 - [C++ Version](#c-version)
 - [Packaging / Installer](#packaging--installer)
 - [Windows Defender / SmartScreen](#windows-defender--smartscreen)
+- [Privacy & Security](#privacy--security)
 - [Usage](#usage)
 - [Contributing](#contributing)
 - [License](#license)
@@ -487,6 +488,21 @@ cpack -G NSIS       # installer (requires NSIS)
 Because the executable is not code-signed, Windows SmartScreen may show a warning on
 first run. Click **More info → Run anyway** to proceed. The source code is fully open
 and the build is reproducible from this repository.
+
+## Privacy & Security
+
+Keyboard Switcher sees every keystroke (it has to, to detect the language), so it ships with **secure defaults**. Each one can be relaxed from the tray menu **Privacy & Security** submenu, or by editing `%APPDATA%\KeyboardSwitcher\settings.json` (kept separate from `user_prefs.json`, so it survives upgrades).
+
+| Setting (`settings.json` key) | Default | What it does |
+|---|---|---|
+| Ignore password fields (`protect_secure_fields`) | **on** | When focus is on a password field (Win32 `ES_PASSWORD`, or any MSAA element flagged `STATE_SYSTEM_PROTECTED` — Chrome, Edge, Firefox, Electron, WPF, WinForms), keystrokes are never buffered, analysed, logged or retyped. Turning it off asks for confirmation |
+| Hide typed text in debug log (`redact_debug_log`) | **on** | The debug log writes `<len=N>` instead of the typed / corrected text. Turn off only when debugging detection |
+| Check for updates on startup (`check_updates_on_startup`) | **on** | Silent GitHub version check 3 s after start. _Check for Updates_ in the tray always works |
+| Require verified updates (`require_verified_updates`, JSON only) | **on** | The downloaded installer must match the SHA-256 `digest` GitHub publishes for the release asset; otherwise it is deleted and not run |
+
+Updater hardening (always on): HTTPS only, downloads restricted to GitHub hosts (`github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`) including after redirects, no HTTPS→HTTP redirect downgrade, HTTP 200 required.
+
+**Reproducible builds:** `.github/workflows/build.yml` builds the ZIP + NSIS installer on GitHub Actions from the public source, checks that the bundled `onnxruntime.dll` is Microsoft-signed, and publishes `SHA256SUMS.txt` with the artifacts.
 
 ## Usage
 

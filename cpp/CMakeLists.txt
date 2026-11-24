@@ -73,6 +73,7 @@ set(SOURCES
     src/TrayIcon.cpp
     src/FeedbackLogger.cpp
     src/Triage.cpp
+    src/Security.cpp
 )
 
 set(HEADERS
@@ -83,6 +84,7 @@ set(HEADERS
     include/TrayIcon.h
     include/FeedbackLogger.h
     include/Triage.h
+    include/Security.h
     resources/resource.h
 )
 
@@ -117,6 +119,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     comctl32
     dwmapi
     winhttp
+    oleacc
+    ole32
+    oleaut32
+    bcrypt
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
