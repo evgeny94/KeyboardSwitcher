@@ -189,7 +189,7 @@ static Layout BuildLayout() {
 
     L.labels.push_back({L"Detection settings", {pad, y, pad + cw, y + 28}, Font::Title, false, false});
     y += 28;
-    L.labels.push_back({L"Control when KeyboardSwitcher fixes text typed in the wrong layout.",
+    L.labels.push_back({L"Fix text typed in the wrong keyboard layout.",
                         {pad, y, pad + cw, y + 18}, Font::Caption, false, true});
     y += 30;
 
