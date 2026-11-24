@@ -18,6 +18,7 @@ static std::atomic<unsigned> g_userDirs{0x1FF};
 static std::atomic<bool>     g_autoExclude{true};
 static std::atomic<DWORD>    g_lastRefresh{0};
 static std::atomic<bool>     g_refreshed{false};
+static std::atomic<bool>     g_frozen{false};      // OverrideInstalled() (preview)
 
 int IndexOf(const std::string& lang) {
     for (int i = 0; i < kNumLangs; ++i)
@@ -45,8 +46,6 @@ void Refresh() {
     g_lastRefresh.store(GetTickCount());
     g_refreshed.store(true);
 }
-
-static std::atomic<bool> g_frozen{false};
 
 void OverrideInstalled(unsigned mask) {
     g_installed.store(mask);
