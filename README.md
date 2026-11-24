@@ -495,8 +495,9 @@ Keyboard Switcher sees every keystroke (it has to, to detect the language), so i
 
 | Setting (`settings.json` key) | Default | What it does |
 |---|---|---|
-| Ignore password fields (`protect_secure_fields`) | **on** | When focus is on a password field (Win32 `ES_PASSWORD`, or any MSAA element flagged `STATE_SYSTEM_PROTECTED` — Chrome, Edge, Firefox, Electron, WPF, WinForms), keystrokes are never buffered, analysed, logged or retyped. Turning it off asks for confirmation |
+| Ignore password fields (`protect_secure_fields`) | **on** | When focus is on a password field, keystrokes are never buffered, analysed, logged or retyped. Detection: MSAA `STATE_SYSTEM_PROTECTED` / Win32 `ES_PASSWORD` on focus events as an instant ON-only fast path, plus a background UI Automation worker (`IsPassword`) that re-checks after every focus change, click and window switch and is the only path that turns protection off (works for Chrome, Edge, Firefox, Electron, WPF, WinForms, UWP). UIA calls never run on the keyboard-hook thread. Transitions are logged as `SECURE-FIELD: ON/OFF` (never with text). Turning it off asks for confirmation |
 | Hide typed text in debug log (`redact_debug_log`) | **on** | The debug log writes `<len=N>` instead of the typed / corrected text. Turn off only when debugging detection |
+| Debug log at startup (`--debug-log` command-line flag) | off | Enables the debug log from launch. If the exe folder is not writable (Program Files), the log goes to `%APPDATA%\KeyboardSwitcher\ks_debug.log` |
 | Check for updates on startup (`check_updates_on_startup`) | **on** | Silent GitHub version check 3 s after start. _Check for Updates_ in the tray always works |
 | Require verified updates (`require_verified_updates`, JSON only) | **on** | The downloaded installer must match the SHA-256 `digest` GitHub publishes for the release asset; otherwise it is deleted and not run |
 
