@@ -150,6 +150,7 @@ static const IID kIID_IUIAutomation =
 
 static std::thread       g_worker;
 static HANDLE            g_wakeEvent  = nullptr;
+static HANDLE            g_doneEvent  = nullptr;   // set when worker exits
 static std::atomic<bool> g_stop{false};
 static HWND              g_notifyHwnd = nullptr;
 static UINT              g_notifyMsg  = 0;
@@ -225,6 +226,7 @@ static void WorkerMain() {
     }
     if (uia) uia->Release();
     CoUninitialize();
+    SetEvent(g_doneEvent);
 }
 
 void StartFocusWorker(HWND notifyHwnd, UINT notifyMsg) {
@@ -232,6 +234,7 @@ void StartFocusWorker(HWND notifyHwnd, UINT notifyMsg) {
     g_notifyHwnd = notifyHwnd;
     g_notifyMsg  = notifyMsg;
     g_wakeEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual reset
+    g_doneEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_stop.store(false);
     g_worker = std::thread(WorkerMain);
 }
@@ -245,7 +248,7 @@ void StopFocusWorker() {
     g_stop.store(true);
     SetEvent(g_wakeEvent);
     // Don't hang shutdown on a UIA call stuck in a hung app.
-    if (WaitForSingleObject(g_worker.native_handle(), 2000) == WAIT_OBJECT_0)
+    if (WaitForSingleObject(g_doneEvent, 2000) == WAIT_OBJECT_0)
         g_worker.join();
     else
         g_worker.detach();
