@@ -45,10 +45,15 @@ void LoadSettings() {
     if (!in.is_open()) { SaveSettings(); return; }  // write defaults once
     try {
         json j = json::parse(in);
-        ProtectSecureFields.store(j.value("protect_secure_fields", true));
-        RedactDebugLog.store(j.value("redact_debug_log", true));
-        CheckUpdatesOnStartup.store(j.value("check_updates_on_startup", true));
-        RequireVerifiedUpdates.store(j.value("require_verified_updates", true));
+        // Per key: a missing or wrong-typed value keeps the secure default.
+        auto flag = [&](const char* k, std::atomic<bool>& dst) {
+            auto it = j.find(k);
+            if (it != j.end() && it->is_boolean()) dst.store(it->get<bool>());
+        };
+        flag("protect_secure_fields",    ProtectSecureFields);
+        flag("redact_debug_log",         RedactDebugLog);
+        flag("check_updates_on_startup", CheckUpdatesOnStartup);
+        flag("require_verified_updates", RequireVerifiedUpdates);
         LangAvail::FromJson(j);
     } catch (...) {
         // Corrupt file — keep secure defaults
@@ -64,115 +69,129 @@ void SaveSettings() {
     j["check_updates_on_startup"] = CheckUpdatesOnStartup.load();
     j["require_verified_updates"] = RequireVerifiedUpdates.load();
     LangAvail::ToJson(j);
-    std::ofstream out(path.c_str(), std::ios::trunc);
-    if (out.is_open()) out << j.dump(2);
+    // Write a temp file and swap it in: a crash never leaves a truncated
+    // settings.json (which would silently reset everything to defaults).
+    std::wstring tmp = path + L".tmp";
+    {
+        std::ofstream out(tmp.c_str(), std::ios::trunc);
+        if (!out.is_open()) return;
+        out << j.dump(2);
+        if (!out.good()) return;
+    }
+    MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 // ── Secure-field detection ───────────────────────────────────
+//
+// All cross-process queries (UIA and MSAA) run on a dedicated MTA worker
+// thread, never on the message-loop thread that also services the
+// low-level keyboard / mouse hooks (a hung target app must not be able
+// to stall input system-wide).  To keep zero latency, every focus change
+// opens a "check pending" window during which the field is treated as
+// protected (fail closed); the worker closes it with its verdict.  A
+// generation counter guarantees that a verdict computed before the
+// latest focus change can never switch protection off.
 
-static std::string ClassOf(HWND hwnd) {
-    wchar_t cls[64] = {};
-    if (hwnd) GetClassNameW(hwnd, cls, _countof(cls));
-    std::string s;
-    for (wchar_t* p = cls; *p; ++p) s += (*p < 128) ? (char)*p : '?';
-    return s;
-}
-
-// Classic Win32 edit control with ES_PASSWORD.
+// Classic Win32 edit controls with ES_PASSWORD.  Exact class names: the
+// ES_PASSWORD bit (0x20) is only meaningful for edit-type classes.
 static bool IsWin32PasswordEdit(HWND hwnd) {
     if (!hwnd) return false;
     wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, _countof(cls));
-    // "Edit", "RichEdit20W", "RICHEDIT50W", WinForms "WindowsForms10.EDIT..."
-    if (!wcsstr(cls, L"Edit") && !wcsstr(cls, L"EDIT")) return false;
-    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-    return (style & ES_PASSWORD) != 0;
+    if (!GetClassNameW(hwnd, cls, _countof(cls))) return false;
+    static const wchar_t* kEdit[] = { L"Edit", L"RichEdit20A", L"RichEdit20W",
+                                      L"RICHEDIT50W", L"TEdit" };
+    bool isEdit = _wcsnicmp(cls, L"WindowsForms10.EDIT", 19) == 0;
+    for (auto* e : kEdit) isEdit = isEdit || _wcsicmp(cls, e) == 0;
+    return isEdit && (GetWindowLongW(hwnd, GWL_STYLE) & ES_PASSWORD) != 0;
 }
-
-// Read MSAA state/role of (acc, child).  Returns true if PROTECTED.
-static bool AccIsProtected(IAccessible* acc, VARIANT child, long* roleOut) {
-    bool isProtected = false;
-    VARIANT v;
-    VariantInit(&v);
-    if (SUCCEEDED(acc->get_accState(child, &v)) && v.vt == VT_I4)
-        isProtected = (v.lVal & STATE_SYSTEM_PROTECTED) != 0;
-    VariantClear(&v);
-    if (roleOut) {
-        *roleOut = 0;
-        VariantInit(&v);
-        if (SUCCEEDED(acc->get_accRole(child, &v)) && v.vt == VT_I4)
-            *roleOut = v.lVal;
-        VariantClear(&v);
-    }
-    return isProtected;
-}
-
-static std::string Describe(const char* src, HWND hwnd, long role, bool secure) {
-    return std::string(src) + " cls=" + ClassOf(hwnd) +
-           " role=" + std::to_string(role) +
-           " secure=" + (secure ? "1" : "0");
-}
-
-std::string OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild) {
-    if (!ProtectSecureFields.load()) { SecureFieldFocused.store(false); return "disabled"; }
-    if (IsWin32PasswordEdit(hwnd)) {
-        SecureFieldFocused.store(true);
-        RequestFocusCheck();
-        return Describe("focus-event/win32", hwnd, 0, true);
-    }
-    bool secure = false;
-    long role = 0;
-    IAccessible* acc = nullptr;
-    VARIANT child;
-    VariantInit(&child);
-    if (hwnd && SUCCEEDED(AccessibleObjectFromEvent(hwnd, idObject, idChild, &acc, &child)) && acc) {
-        secure = AccIsProtected(acc, child, &role);
-        acc->Release();
-    }
-    VariantClear(&child);
-    // Fast path only ever turns protection ON (no latency before the
-    // first keystroke).  Turning it OFF is left to the UIA worker, so
-    // stray events (e.g. the shell's ForegroundStaging window) can't
-    // clear it while a password field still has focus.
-    if (secure) SecureFieldFocused.store(true);
-    RequestFocusCheck();
-    return Describe("focus-event/msaa", hwnd, role, secure);
-}
-
-// ── UI Automation focus worker ───────────────────────────────
-// UIA reliably reports IsPassword for browsers (Chrome/Edge/Firefox),
-// Electron, WPF, UWP/WinUI and Win32.  Queries are cross-process and can
-// block on a hung app, so they run on a dedicated MTA thread — never on
-// the keyboard-hook thread.
 
 // GUIDs defined locally (avoids depending on toolchain uuid libs).
 static const CLSID kCLSID_CUIAutomation =
     {0xff48dba4, 0x60ef, 0x4201, {0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e}};
 static const IID kIID_IUIAutomation =
     {0x30cbe57d, 0xd9d0, 0x452a, {0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee}};
+static const IID kIID_IUIAutomation2 =
+    {0x34723aff, 0x0c9d, 0x49d0, {0x98, 0x96, 0x7a, 0xb5, 0x2d, 0xf8, 0xcd, 0x8a}};
 
-static std::thread       g_worker;
-static HANDLE            g_wakeEvent  = nullptr;
-static HANDLE            g_doneEvent  = nullptr;   // set when worker exits
-static std::atomic<bool> g_stop{false};
-static HWND              g_notifyHwnd = nullptr;
-static UINT              g_notifyMsg  = 0;
-static std::mutex        g_descMutex;
-static std::string       g_lastDesc;
+static std::thread           g_worker;
+static HANDLE                g_wakeEvent  = nullptr;
+static HANDLE                g_doneEvent  = nullptr;   // worker exited (MinGW's std::thread has no HANDLE)
+static std::atomic<bool>     g_stop{false};
+static HWND                  g_notifyHwnd = nullptr;
+static UINT                  g_notifyMsg  = 0;
+static std::atomic<unsigned> g_requested{0};   // bumped on every focus change
+static std::atomic<unsigned> g_checked{0};     // generation the last verdict covers
 
-static std::string Narrow(const wchar_t* w) {
-    std::string s;
-    if (w) for (const wchar_t* p = w; *p; ++p) s += (*p < 128) ? (char)*p : '?';
-    return s;
+// Latest EVENT_OBJECT_FOCUS target, for the worker's MSAA check.
+static std::mutex g_evMutex;
+static HWND       g_evHwnd   = nullptr;
+static LONG       g_evObject = 0;
+static LONG       g_evChild  = 0;
+
+bool IsSecureFieldActive() {
+    if (!ProtectSecureFields.load()) return false;
+    return SecureFieldFocused.load() || g_checked.load() != g_requested.load();
 }
 
-// Win32 fallback: focused HWND of the foreground thread.
-static bool Win32FocusIsPassword(std::string& cls) {
+void RequestFocusCheck() {
+    if (!g_wakeEvent) return;
+    g_requested.fetch_add(1);
+    SetEvent(g_wakeEvent);
+}
+
+void OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild) {
+    {
+        std::lock_guard<std::mutex> lk(g_evMutex);
+        g_evHwnd = hwnd; g_evObject = idObject; g_evChild = idChild;
+    }
+    RequestFocusCheck();
+}
+
+// Verdicts: 1 = password, 0 = not a password, -1 = could not tell.
+
+// MSAA: STATE_SYSTEM_PROTECTED on the object named by the focus event.
+static int MsaaIsProtected() {
+    HWND hwnd; LONG obj, child;
+    {
+        std::lock_guard<std::mutex> lk(g_evMutex);
+        hwnd = g_evHwnd; obj = g_evObject; child = g_evChild;
+    }
+    if (!hwnd || !IsWindow(hwnd)) return -1;
+    IAccessible* acc = nullptr;
+    VARIANT vChild;
+    VariantInit(&vChild);
+    int result = -1;
+    if (SUCCEEDED(AccessibleObjectFromEvent(hwnd, obj, child, &acc, &vChild)) && acc) {
+        VARIANT v;
+        VariantInit(&v);
+        if (SUCCEEDED(acc->get_accState(vChild, &v)) && v.vt == VT_I4)
+            result = (v.lVal & STATE_SYSTEM_PROTECTED) ? 1 : 0;
+        VariantClear(&v);
+        acc->Release();
+    }
+    VariantClear(&vChild);
+    return result;
+}
+
+// UIA: IsPassword of the focused element.
+static int UiaIsPassword(IUIAutomation* uia) {
+    if (!uia) return -1;
+    IUIAutomationElement* el = nullptr;
+    int result = -1;
+    if (SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
+        BOOL isPwd = FALSE;
+        if (SUCCEEDED(el->get_CurrentIsPassword(&isPwd))) result = isPwd ? 1 : 0;
+        el->Release();
+    }
+    return result;
+}
+
+// Win32: focused HWND of the foreground thread.
+static bool Win32FocusIsPassword() {
     HWND fg = GetForegroundWindow();
     GUITHREADINFO gti = { sizeof(gti) };
     DWORD tid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
     HWND focus = (tid && GetGUIThreadInfo(tid, &gti) && gti.hwndFocus) ? gti.hwndFocus : fg;
-    cls = ClassOf(focus);
     return IsWin32PasswordEdit(focus);
 }
 
@@ -181,51 +200,37 @@ static void WorkerMain() {
     IUIAutomation* uia = nullptr;
     CoCreateInstance(kCLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
                      kIID_IUIAutomation, (void**)&uia);
+    // Bound how long a hung target app can keep a check pending.
+    IUIAutomation2* uia2 = nullptr;
+    if (uia && SUCCEEDED(uia->QueryInterface(kIID_IUIAutomation2, (void**)&uia2)) && uia2) {
+        uia2->put_ConnectionTimeout(1000);
+        uia2->put_TransactionTimeout(1000);
+        uia2->Release();
+    }
 
     while (!g_stop.load()) {
         if (WaitForSingleObject(g_wakeEvent, INFINITE) != WAIT_OBJECT_0) break;
         if (g_stop.load()) break;
         Sleep(30);                    // debounce bursts of focus events
         ResetEvent(g_wakeEvent);      // coalesce requests made meanwhile
+        const unsigned gen = g_requested.load();
 
-        std::string desc;
-        bool secure = false;
+        const bool prev = SecureFieldFocused.load();
+        bool secure = prev;
         if (!ProtectSecureFields.load()) {
-            desc = "disabled";
+            secure = false;
         } else {
-            bool decided = false;
-            if (uia) {
-                IUIAutomationElement* el = nullptr;
-                if (SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
-                    BOOL isPwd = FALSE;
-                    CONTROLTYPEID ct = 0;
-                    BSTR cls = nullptr;
-                    int pid = 0;
-                    if (SUCCEEDED(el->get_CurrentIsPassword(&isPwd))) decided = true;
-                    el->get_CurrentControlType(&ct);
-                    el->get_CurrentClassName(&cls);
-                    el->get_CurrentProcessId(&pid);
-                    secure = decided && isPwd;
-                    desc = "uia ctrl=" + std::to_string(ct) +
-                           " cls=" + Narrow(cls) +
-                           " pwd=" + (isPwd ? "1" : "0");
-                    if (cls) SysFreeString(cls);
-                    el->Release();
-                }
-            }
-            std::string wcls;
-            if (Win32FocusIsPassword(wcls)) {      // belt and braces
-                secure = true; decided = true;
-                desc += " win32-pwd cls=" + wcls;
-            }
-            if (!decided) desc = "uia-unavailable cls=" + wcls;
+            int u = UiaIsPassword(uia);
+            int m = MsaaIsProtected();
+            bool w = Win32FocusIsPassword();
+            if (u == 1 || m == 1 || w) secure = true;
+            else if (u == 0 || m == 0) secure = false;
+            // else nobody could tell: keep the previous verdict.
         }
         SecureFieldFocused.store(secure);
-        {
-            std::lock_guard<std::mutex> lk(g_descMutex);
-            g_lastDesc = desc + " secure=" + (secure ? "1" : "0");
-        }
-        if (g_notifyHwnd) PostMessageW(g_notifyHwnd, g_notifyMsg, 0, 0);
+        g_checked.store(gen);         // a newer request keeps the check pending
+        if (g_notifyHwnd && secure != prev)
+            PostMessageW(g_notifyHwnd, g_notifyMsg, secure ? 1 : 0, 0);
     }
     if (uia) uia->Release();
     CoUninitialize();
@@ -242,24 +247,21 @@ void StartFocusWorker(HWND notifyHwnd, UINT notifyMsg) {
     g_worker = std::thread(WorkerMain);
 }
 
-void RequestFocusCheck() {
-    if (g_wakeEvent) SetEvent(g_wakeEvent);
-}
-
 void StopFocusWorker() {
     if (!g_worker.joinable()) return;
     g_stop.store(true);
     SetEvent(g_wakeEvent);
-    // Don't hang shutdown on a UIA call stuck in a hung app.
-    if (WaitForSingleObject(g_doneEvent, 2000) == WAIT_OBJECT_0)
+    // Don't hang shutdown on a UIA call stuck in a hung app.  On timeout
+    // the thread is detached and the event handles are deliberately
+    // leaked (it may still use them).  The worker touches only atomics,
+    // those handles, g_evMutex and its own locals; the process is exiting anyway.
+    if (WaitForSingleObject(g_doneEvent, 2000) == WAIT_OBJECT_0) {
         g_worker.join();
-    else
+        CloseHandle(g_wakeEvent); g_wakeEvent = nullptr;
+        CloseHandle(g_doneEvent); g_doneEvent = nullptr;
+    } else {
         g_worker.detach();
-}
-
-std::string LastFocusCheck() {
-    std::lock_guard<std::mutex> lk(g_descMutex);
-    return g_lastDesc;
+    }
 }
 
 // ── Update verification ──────────────────────────────────────

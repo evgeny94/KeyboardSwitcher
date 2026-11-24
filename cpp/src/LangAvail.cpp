@@ -131,18 +131,24 @@ static std::string DirKey(int f, int t) {
     return std::string(kLangs[f]) + "->" + kLangs[t];
 }
 
+// A missing or wrong-typed value means "enabled" (the default).
+static bool BoolOr(const nlohmann::json& obj, const std::string& key, bool def) {
+    auto it = obj.find(key);
+    return (it != obj.end() && it->is_boolean()) ? it->get<bool>() : def;
+}
+
 void FromJson(const nlohmann::json& j) {
     if (!j.is_object()) return;
-    g_autoExclude.store(j.value("auto_exclude_missing_layouts", true));
+    g_autoExclude.store(BoolOr(j, "auto_exclude_missing_layouts", true));
     auto langs = j.find("languages");
     if (langs != j.end() && langs->is_object())
         for (int i = 0; i < kNumLangs; ++i)
-            SetBit(g_userLangs, i, langs->value(kLangs[i], true));
+            SetBit(g_userLangs, i, BoolOr(*langs, kLangs[i], true));
     auto dirs = j.find("directions");
     if (dirs != j.end() && dirs->is_object())
         for (int f = 0; f < kNumLangs; ++f)
             for (int t = 0; t < kNumLangs; ++t)
-                if (f != t) SetBit(g_userDirs, f * kNumLangs + t, dirs->value(DirKey(f, t), true));
+                if (f != t) SetBit(g_userDirs, f * kNumLangs + t, BoolOr(*dirs, DirKey(f, t), true));
 }
 
 void ToJson(nlohmann::json& j) {

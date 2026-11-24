@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <mutex>
 #include <shlobj.h>
 #include <commctrl.h>
 #include <strsafe.h>
@@ -48,8 +49,10 @@
 // Entries are timestamped.  When the file exceeds MAX_LOG_BYTES
 // the oldest half is discarded (roll).
 // ============================================================
-static std::string  g_debugLogPath;
+static std::wstring g_debugLogPath;
 static std::ofstream g_debugLog;
+// Dbg() is also called from the updater's background threads.
+static std::recursive_mutex g_dbgMutex;
 static bool          g_debugLogEnabled = false;
 static constexpr size_t MAX_LOG_BYTES = 512 * 1024;  // 512 KB
 
@@ -60,14 +63,13 @@ static void DbgInit() {
     std::wstring dir(path);
     size_t pos = dir.find_last_of(L"\\/");
     if (pos != std::wstring::npos) dir = dir.substr(0, pos);
-    g_debugLogPath.assign(dir.begin(), dir.end());
-    g_debugLogPath += "\\ks_debug.log";
+    g_debugLogPath = dir + L"\\ks_debug.log";
 }
 
 static void DbgOpen() {
     if (g_debugLog.is_open()) return;
     // Open in append mode so we keep prior entries from this session
-    g_debugLog.open(g_debugLogPath, std::ios::app);
+    g_debugLog.open(g_debugLogPath.c_str(), std::ios::app);
     if (!g_debugLog.is_open()) {
         // Exe folder not writable (e.g. installed under Program Files):
         // fall back to %APPDATA%\KeyboardSwitcher\ks_debug.log
@@ -77,12 +79,8 @@ static void DbgOpen() {
             CreateDirectoryW(dir.c_str(), nullptr);
             std::wstring p = dir + L"\\ks_debug.log";
             g_debugLog.open(p.c_str(), std::ios::app);
-            if (g_debugLog.is_open()) {
-                int n = WideCharToMultiByte(CP_ACP, 0, p.c_str(), -1, nullptr, 0, nullptr, nullptr);
-                std::string s(n > 0 ? n - 1 : 0, '\0');
-                if (n > 0) WideCharToMultiByte(CP_ACP, 0, p.c_str(), -1, &s[0], n, nullptr, nullptr);
-                g_debugLogPath = s;   // so rolling uses the same file
-            }
+            if (g_debugLog.is_open())
+                g_debugLogPath = p;   // so rolling uses the same file
         }
     }
 }
@@ -97,7 +95,7 @@ static void DbgRollIfNeeded() {
     g_debugLog.flush();
 
     // Check current file size
-    std::ifstream in(g_debugLogPath, std::ios::ate | std::ios::binary);
+    std::ifstream in(g_debugLogPath.c_str(), std::ios::ate | std::ios::binary);
     if (!in) return;
     auto fileSize = static_cast<size_t>(in.tellg());
     if (fileSize <= MAX_LOG_BYTES) return;
@@ -118,7 +116,7 @@ static void DbgRollIfNeeded() {
     // Re-open in truncate mode and write the kept portion
     DbgClose();
     {
-        std::ofstream out(g_debugLogPath, std::ios::trunc);
+        std::ofstream out(g_debugLogPath.c_str(), std::ios::trunc);
         out << "[LOG ROLLED — older entries discarded]\n";
         out << kept;
     }
@@ -126,6 +124,7 @@ static void DbgRollIfNeeded() {
 }
 
 static void DbgSetEnabled(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lk(g_dbgMutex);
     g_debugLogEnabled = enabled;
     if (enabled) {
         DbgOpen();
@@ -165,6 +164,7 @@ static std::string ws2s(const std::wstring& w) {
 }
 
 static void Dbg(const char* fmt, ...) {
+    std::lock_guard<std::recursive_mutex> lk(g_dbgMutex);
     if (!g_debugLogEnabled || !g_debugLog.is_open()) return;
     va_list ap;
     va_start(ap, fmt);
@@ -193,6 +193,7 @@ struct UpdateInfo {
 static UpdateInfo  g_updateInfo;
 static bool        g_updateCheckManual = false;
 static std::wstring g_downloadedInstallerPath;  // path to the downloaded file
+static HANDLE       g_installerLock = nullptr;     // share-read handle held until launch
 
 // Compare semver strings "X.Y.Z". Returns >0 if a > b, 0 if equal, <0 if a < b.
 static int CompareVersions(const std::string& a, const std::string& b) {
@@ -311,7 +312,10 @@ static bool FetchLatestReleaseInfo(UpdateInfo& info) {
         std::string tag = j.value("tag_name", "");
         if (!tag.empty() && (tag[0] == 'v' || tag[0] == 'V'))
             tag = tag.substr(1);
-        if (tag.empty()) return false;
+        if (tag.empty() || tag.size() > 32) return false;
+        // The tag becomes part of a file name: allow version characters only.
+        for (char c : tag)
+            if (!isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-') return false;
         info.version = tag;
 
         // Find the NSIS installer asset (*.exe)
@@ -323,6 +327,12 @@ static bool FetchLatestReleaseInfo(UpdateInfo& info) {
                     name.substr(name.size() - 4) == ".exe") {
                     info.downloadUrl = asset.value(
                         "browser_download_url", "");
+                    // Only this project's release assets (the host
+                    // allowlist alone would accept any GitHub repo).
+                    static const char kPrefix[] =
+                        "https://github.com/kertser/KeyboardSwitcher/releases/download/";
+                    if (info.downloadUrl.rfind(kPrefix, 0) != 0)
+                        info.downloadUrl.clear();
                     // GitHub publishes "digest": "sha256:<hex>" per asset.
                     std::string digest = asset.value("digest", "");
                     if (digest.rfind("sha256:", 0) == 0) {
@@ -541,11 +551,21 @@ static void CheckForUpdatesAsync(bool manual, int delaySec = 0) {
 // Start downloading the installer in a background thread.
 static void DownloadUpdateAsync() {
     std::thread([]() {
-        // Build destination path: %TEMP%\KeyboardSwitcher-X.Y.Z-win64.exe
+        // Destination: a fresh, randomly named directory under %TEMP%
+        // (not a predictable path other processes could pre-create or
+        // plant DLLs next to).
         wchar_t tempDir[MAX_PATH] = {};
         GetTempPathW(MAX_PATH, tempDir);
-        std::wstring dest = tempDir;
-        dest += L"KeyboardSwitcher-";
+        GUID g;
+        wchar_t gs[64] = {};
+        if (FAILED(CoCreateGuid(&g)) || !StringFromGUID2(g, gs, 64)) {
+            g_downloadedInstallerPath.clear();
+            if (g_hwndHidden) PostMessage(g_hwndHidden, WM_UPDATE_DOWNLOAD_DONE, 0, 0);
+            return;
+        }
+        std::wstring dir = std::wstring(tempDir) + L"KeyboardSwitcher-update-" + gs;
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::wstring dest = dir + L"\\KeyboardSwitcher-";
         dest += std::wstring(g_updateInfo.version.begin(),
                              g_updateInfo.version.end());
         dest += L"-win64.exe";
@@ -556,6 +576,14 @@ static void DownloadUpdateAsync() {
         // for the release asset.  A missing digest is treated as a
         // failure unless the user explicitly disabled verification in
         // settings.json ("require_verified_updates": false).
+        // Lock the file against modification before hashing it, and keep
+        // the lock until the installer has been launched (no swap between
+        // verification and execution).
+        if (ok) {
+            g_installerLock = CreateFileW(dest.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (g_installerLock == INVALID_HANDLE_VALUE) { g_installerLock = nullptr; ok = false; }
+        }
         if (ok) {
             const std::string& expected = g_updateInfo.sha256;
             if (!expected.empty()) {
@@ -568,7 +596,10 @@ static void DownloadUpdateAsync() {
                 Dbg("UPDATE: no SHA-256 digest published — installer discarded");
                 ok = false;
             }
-            if (!ok) DeleteFileW(dest.c_str());
+        }
+        if (!ok) {
+            if (g_installerLock) { CloseHandle(g_installerLock); g_installerLock = nullptr; }
+            DeleteFileW(dest.c_str());
         }
         g_downloadedInstallerPath = ok ? dest : L"";
         if (g_hwndHidden)
@@ -642,6 +673,7 @@ static void HandleUpdateDownloadDone() {
         nullptr, L"open",
         g_downloadedInstallerPath.c_str(),
         nullptr, nullptr, SW_SHOWNORMAL);
+    if (g_installerLock) { CloseHandle(g_installerLock); g_installerLock = nullptr; }
 
     if ((INT_PTR)hInst > 32) {
         // Installer launched successfully — exit so it can replace us
@@ -1216,23 +1248,6 @@ static void HandleFocusChange(bool forceSearch = false) {
 
 // ============================================================
 // WinEvent callback — fired by the OS on foreground changes
-// ── Secure-field (password) tracking helpers ────────────────
-static bool g_lastLoggedSecure = false;
-
-// Log only on/off transitions (diagnostics never include typed text).
-static void LogSecureFieldChange(const std::string& why) {
-    bool now = Security::SecureFieldFocused.load();
-    if (now != g_lastLoggedSecure) {
-        g_lastLoggedSecure = now;
-        Dbg("SECURE-FIELD: %s (%s)", now ? "ON" : "OFF", why.c_str());
-    }
-}
-
-// Ask the UIA worker to re-check focus (after clicks / window switches).
-static void ScheduleSecureFieldRefresh() {
-    Security::RequestFocusCheck();
-}
-
 // ============================================================
 // Installed with WINEVENT_OUTOFCONTEXT so the callback is
 // delivered on the message-loop thread via the message pump.
@@ -1248,16 +1263,16 @@ static void CALLBACK WinEventProc(
         // a switch) — they would wrongly clear the flag.  Re-check soon.
         HWND root = hwnd ? GetAncestor(hwnd, GA_ROOT) : nullptr;
         if (!root || root != GetForegroundWindow()) {
-            ScheduleSecureFieldRefresh();
+            Security::RequestFocusCheck();
             return;
         }
-        LogSecureFieldChange(Security::OnFocusEvent(hwnd, idObject, idChild));
+        Security::OnFocusEvent(hwnd, idObject, idChild);
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
         // Focus events can arrive before / without the foreground event;
         // re-check what is actually focused once the switch settles.
-        ScheduleSecureFieldRefresh();
+        Security::RequestFocusCheck();
         if (!Config::EnableSwitcher.load()) return;
         HandleFocusChange();
     }
@@ -1512,8 +1527,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     // --- Privacy: password / protected fields ---
     // Never buffer, analyse, log or retype keystrokes while focus is
     // on a password field.  Drop any partial word and pass the key on.
-    if (Security::ProtectSecureFields.load() &&
-        Security::SecureFieldFocused.load()) {
+    if (Security::IsSecureFieldActive()) {
         if (g_cache.Size() > 0) g_cache.Clear();
         g_history.Clear();
         g_lastCorrection.valid = false;
@@ -2312,7 +2326,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                             if (upper != ch) {
                                 correctedText[i] = upper;
-                                Dbg("CAPITALIZE[%zu]: U+%04X → U+%04X",
+                                if (!Security::RedactDebugLog.load())
+                                    Dbg("CAPITALIZE[%zu]: U+%04X → U+%04X",
                                     i, (unsigned)ch, (unsigned)upper);
                             }
                         }
@@ -2458,7 +2473,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
     // Clicking may move focus into (or out of) a password field.
     if (wParam == WM_LBUTTONUP)
-        ScheduleSecureFieldRefresh();
+        Security::RequestFocusCheck();
 
     if (!Config::EnableSwitcher.load())
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
@@ -2635,12 +2650,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         HandleUpdateCheckResult();
         return 0;
 
-    case WM_SECURE_CHECK_DONE: {
-        std::string why = Security::LastFocusCheck();
-        Dbg("SECURE-CHECK: %s", why.c_str());
-        LogSecureFieldChange(why);
+    case WM_SECURE_CHECK_DONE:
+        // Posted only on transitions; never includes field contents.
+        Dbg("SECURE-FIELD: %s", wParam ? "ON" : "OFF");
         return 0;
-    }
 
     case WM_UPDATE_DOWNLOAD_DONE:
         HandleUpdateDownloadDone();
@@ -2668,7 +2681,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     // ---- Initialize debug log ----
     DbgInit();
     // "--debug-log" enables the debug log from startup (developers / bug reports)
-    if (lpCmdLine && strstr(lpCmdLine, "--debug-log")) DbgSetEnabled(true);
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        for (int i = 1; argv && i < argc; ++i)
+            if (wcscmp(argv[i], L"--debug-log") == 0) DbgSetEnabled(true);
+        if (argv) LocalFree(argv);
+    }
     Dbg("=== KeyboardSwitcher started ===");
 
     // ---- Common controls (tooltips in the settings flyout) ----
