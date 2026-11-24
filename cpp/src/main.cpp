@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <commctrl.h>
 #include <strsafe.h>
 
@@ -65,6 +66,23 @@ static void DbgOpen() {
     if (g_debugLog.is_open()) return;
     // Open in append mode so we keep prior entries from this session
     g_debugLog.open(g_debugLogPath, std::ios::app);
+    if (!g_debugLog.is_open()) {
+        // Exe folder not writable (e.g. installed under Program Files):
+        // fall back to %APPDATA%\KeyboardSwitcher\ks_debug.log
+        wchar_t appData[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
+            std::wstring dir = std::wstring(appData) + L"\\KeyboardSwitcher";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::wstring p = dir + L"\\ks_debug.log";
+            g_debugLog.open(p.c_str(), std::ios::app);
+            if (g_debugLog.is_open()) {
+                int n = WideCharToMultiByte(CP_ACP, 0, p.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                std::string s(n > 0 ? n - 1 : 0, '\0');
+                if (n > 0) WideCharToMultiByte(CP_ACP, 0, p.c_str(), -1, &s[0], n, nullptr, nullptr);
+                g_debugLogPath = s;   // so rolling uses the same file
+            }
+        }
+    }
 }
 
 static void DbgClose() {
@@ -1209,6 +1227,25 @@ static void HandleFocusChange(bool forceSearch = false) {
 
 // ============================================================
 // WinEvent callback — fired by the OS on foreground changes
+// ── Secure-field (password) tracking helpers ────────────────
+static constexpr UINT_PTR TIMER_SECURE_REFRESH = 2;
+static bool g_lastLoggedSecure = false;
+
+// Log only on/off transitions (diagnostics never include typed text).
+static void LogSecureFieldChange(const std::string& why) {
+    bool now = Security::SecureFieldFocused.load();
+    if (now != g_lastLoggedSecure) {
+        g_lastLoggedSecure = now;
+        Dbg("SECURE-FIELD: %s (%s)", now ? "ON" : "OFF", why.c_str());
+    }
+}
+
+// Re-evaluate focus ~100 ms from now (after clicks / window switches).
+static void ScheduleSecureFieldRefresh() {
+    if (g_hwndHidden)
+        SetTimer(g_hwndHidden, TIMER_SECURE_REFRESH, 100, nullptr);
+}
+
 // ============================================================
 // Installed with WINEVENT_OUTOFCONTEXT so the callback is
 // delivered on the message-loop thread via the message pump.
@@ -1219,11 +1256,13 @@ static void CALLBACK WinEventProc(
 {
     if (event == EVENT_OBJECT_FOCUS) {
         // Track whether keyboard focus is on a password field.
-        Security::OnFocusEvent(hwnd, idObject, idChild);
+        LogSecureFieldChange(Security::OnFocusEvent(hwnd, idObject, idChild));
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        Security::OnFocusEvent(nullptr, 0, 0);
+        // Focus events can arrive before / without the foreground event;
+        // re-check what is actually focused once the switch settles.
+        ScheduleSecureFieldRefresh();
         if (!Config::EnableSwitcher.load()) return;
         HandleFocusChange();
     }
@@ -2403,6 +2442,10 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+    // Clicking may move focus into (or out of) a password field.
+    if (wParam == WM_LBUTTONUP)
+        ScheduleSecureFieldRefresh();
+
     if (!Config::EnableSwitcher.load())
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 
@@ -2933,7 +2976,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     break;
             }
             Security::ProtectSecureFields.store(!Security::ProtectSecureFields.load());
-            Security::OnFocusEvent(nullptr, 0, 0);
+            LogSecureFieldChange(Security::RefreshFocus());
             Security::SaveSettings();
             break;
         case ID_TRAY_REDACT_DEBUG:
@@ -2980,6 +3023,11 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_TIMER:
+        if (wParam == TIMER_SECURE_REFRESH) {
+            KillTimer(hwnd, TIMER_SECURE_REFRESH);   // one-shot
+            LogSecureFieldChange(Security::RefreshFocus());
+            return 0;
+        }
         // Periodic cleanup of closed windows from the tracker
         if (g_windows) {
             g_windows->Cleanup();
@@ -2996,9 +3044,11 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // ============================================================
 // WinMain - application entry point
 // ============================================================
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     // ---- Initialize debug log ----
     DbgInit();
+    // "--debug-log" enables the debug log from startup (developers / bug reports)
+    if (lpCmdLine && strstr(lpCmdLine, "--debug-log")) DbgSetEnabled(true);
     Dbg("=== KeyboardSwitcher started ===");
 
     // ---- Common controls (trackbar + updown spin for the settings flyout) ----
@@ -3133,7 +3183,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
         nullptr, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    Security::OnFocusEvent(nullptr, 0, 0);
+    LogSecureFieldChange(Security::RefreshFocus());
 
     // Check for updates in the background (3-second delay so the app
     // starts up smoothly; silent if already on the latest version).

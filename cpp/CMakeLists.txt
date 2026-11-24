@@ -123,6 +123,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ole32
     oleaut32
     bcrypt
+    uuid
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

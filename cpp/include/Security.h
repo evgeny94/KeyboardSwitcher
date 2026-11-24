@@ -39,11 +39,14 @@ namespace Security {
     // Updated from WinEvent focus notifications (UI thread).
     extern std::atomic<bool> SecureFieldFocused;
 
-    // Re-evaluate the focused element.  Call from a WinEvent hook
-    // for EVENT_OBJECT_FOCUS (pass its hwnd/idObject/idChild) or
-    // EVENT_SYSTEM_FOREGROUND (pass nullptr/0/0 to inspect the
-    // foreground thread's focused HWND only).
-    void OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild);
+    // Evaluate the object named by an EVENT_OBJECT_FOCUS WinEvent.
+    // Returns a short diagnostic (class / role / result — never text).
+    std::string OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild);
+
+    // Re-evaluate whatever currently has keyboard focus (Win32 focus
+    // HWND + MSAA accFocus walk).  Use after window switches / clicks,
+    // where focus events may arrive out of order or not at all.
+    std::string RefreshFocus();
 
     // ── Update verification helpers ───────────────────────────
     // Hosts the updater may talk to (exact match, HTTPS only).

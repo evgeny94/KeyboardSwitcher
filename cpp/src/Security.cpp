@@ -64,6 +64,14 @@ void SaveSettings() {
 
 // ── Secure-field detection ───────────────────────────────────
 
+static std::string ClassOf(HWND hwnd) {
+    wchar_t cls[64] = {};
+    if (hwnd) GetClassNameW(hwnd, cls, _countof(cls));
+    std::string s;
+    for (wchar_t* p = cls; *p; ++p) s += (*p < 128) ? (char)*p : '?';
+    return s;
+}
+
 // Classic Win32 edit control with ES_PASSWORD.
 static bool IsWin32PasswordEdit(HWND hwnd) {
     if (!hwnd) return false;
@@ -75,47 +83,103 @@ static bool IsWin32PasswordEdit(HWND hwnd) {
     return (style & ES_PASSWORD) != 0;
 }
 
-// MSAA: browsers (Chrome/Edge/Firefox), Electron, WPF, WinForms and
-// most UI frameworks expose password inputs with STATE_SYSTEM_PROTECTED.
-static bool IsProtectedAccessible(HWND hwnd, LONG idObject, LONG idChild) {
-    if (!hwnd) return false;
-    IAccessible* acc = nullptr;
-    VARIANT child;
-    VariantInit(&child);
-    if (FAILED(AccessibleObjectFromEvent(hwnd, idObject, idChild, &acc, &child)) || !acc)
-        return false;
+// Read MSAA state/role of (acc, child).  Returns true if PROTECTED.
+static bool AccIsProtected(IAccessible* acc, VARIANT child, long* roleOut) {
     bool isProtected = false;
-    VARIANT state;
-    VariantInit(&state);
-    if (SUCCEEDED(acc->get_accState(child, &state)) && state.vt == VT_I4) {
-        isProtected = (state.lVal & STATE_SYSTEM_PROTECTED) != 0;
+    VARIANT v;
+    VariantInit(&v);
+    if (SUCCEEDED(acc->get_accState(child, &v)) && v.vt == VT_I4)
+        isProtected = (v.lVal & STATE_SYSTEM_PROTECTED) != 0;
+    VariantClear(&v);
+    if (roleOut) {
+        *roleOut = 0;
+        VariantInit(&v);
+        if (SUCCEEDED(acc->get_accRole(child, &v)) && v.vt == VT_I4)
+            *roleOut = v.lVal;
+        VariantClear(&v);
     }
-    VariantClear(&state);
-    VariantClear(&child);
-    acc->Release();
     return isProtected;
 }
 
-void OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild) {
-    if (!ProtectSecureFields.load()) {
-        SecureFieldFocused.store(false);
-        return;
+static std::string Describe(const char* src, HWND hwnd, long role, bool secure) {
+    return std::string(src) + " cls=" + ClassOf(hwnd) +
+           " role=" + std::to_string(role) +
+           " secure=" + (secure ? "1" : "0");
+}
+
+std::string OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild) {
+    if (!ProtectSecureFields.load()) { SecureFieldFocused.store(false); return "disabled"; }
+    if (IsWin32PasswordEdit(hwnd)) {
+        SecureFieldFocused.store(true);
+        return Describe("focus-event/win32", hwnd, 0, true);
     }
     bool secure = false;
+    long role = 0;
+    IAccessible* acc = nullptr;
+    VARIANT child;
+    VariantInit(&child);
+    if (hwnd && SUCCEEDED(AccessibleObjectFromEvent(hwnd, idObject, idChild, &acc, &child)) && acc) {
+        secure = AccIsProtected(acc, child, &role);
+        acc->Release();
+    }
+    VariantClear(&child);
+    SecureFieldFocused.store(secure);
+    return Describe("focus-event/msaa", hwnd, role, secure);
+}
 
-    // Win32 focus HWND of the foreground thread.
-    GUITHREADINFO gti = { sizeof(gti) };
+std::string RefreshFocus() {
+    if (!ProtectSecureFields.load()) { SecureFieldFocused.store(false); return "disabled"; }
+
     HWND fg = GetForegroundWindow();
+    HWND focus = fg;
+    GUITHREADINFO gti = { sizeof(gti) };
     DWORD tid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
-    if (tid && GetGUIThreadInfo(tid, &gti)) {
-        secure = IsWin32PasswordEdit(gti.hwndFocus);
+    if (tid && GetGUIThreadInfo(tid, &gti) && gti.hwndFocus)
+        focus = gti.hwndFocus;
+    if (!focus) { SecureFieldFocused.store(false); return "refresh no-focus"; }
+
+    if (IsWin32PasswordEdit(focus)) {
+        SecureFieldFocused.store(true);
+        return Describe("refresh/win32", focus, 0, true);
     }
 
-    // Accessible object that just received focus.
-    if (!secure && hwnd) {
-        secure = IsProtectedAccessible(hwnd, idObject, idChild);
+    // MSAA: walk accFocus from the focus window's client object down to
+    // the focused leaf (browsers report the focused DOM node this way).
+    bool secure = false;
+    long role = 0;
+    IAccessible* acc = nullptr;
+    if (SUCCEEDED(AccessibleObjectFromWindow(focus, (DWORD)OBJID_CLIENT,
+                                             IID_IAccessible, (void**)&acc)) && acc) {
+        for (int depth = 0; depth < 16 && acc; ++depth) {
+            VARIANT f;
+            VariantInit(&f);
+            if (FAILED(acc->get_accFocus(&f)) || f.vt == VT_EMPTY) {
+                VARIANT self; VariantInit(&self); self.vt = VT_I4; self.lVal = CHILDID_SELF;
+                secure = AccIsProtected(acc, self, &role);
+                VariantClear(&f);
+                break;
+            }
+            if (f.vt == VT_DISPATCH && f.pdispVal) {
+                IAccessible* next = nullptr;
+                f.pdispVal->QueryInterface(IID_IAccessible, (void**)&next);
+                VariantClear(&f);
+                if (!next || next == acc) { if (next) next->Release(); break; }
+                acc->Release();
+                acc = next;
+                continue;
+            }
+            if (f.vt == VT_I4) {
+                secure = AccIsProtected(acc, f, &role);   // child id (or SELF)
+                VariantClear(&f);
+                break;
+            }
+            VariantClear(&f);
+            break;
+        }
+        if (acc) acc->Release();
     }
     SecureFieldFocused.store(secure);
+    return Describe("refresh/msaa", focus, role, secure);
 }
 
 // ── Update verification ──────────────────────────────────────
