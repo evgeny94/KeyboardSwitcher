@@ -1,5 +1,5 @@
-# Reproducible public build: anyone can see exactly which source
-# produced the installer, and compare SHA-256 with release assets.
+# Public CI build: anyone can see exactly which source produced the
+# installer; SHA256SUMS.txt is published with the artifacts.
 name: build
 
 on:

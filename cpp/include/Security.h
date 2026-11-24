@@ -35,22 +35,25 @@ namespace Security {
     void SaveSettings();
 
     // ── Secure-field detection ────────────────────────────────
-    // True while keyboard focus is on a password / protected field.
-    // Updated from WinEvent focus notifications (UI thread).
+    // Verdict of the last focus check (written by the focus worker).
     extern std::atomic<bool> SecureFieldFocused;
 
-    // Evaluate the object named by an EVENT_OBJECT_FOCUS WinEvent.
-    // Returns a short diagnostic (class / role / result — never text).
-    std::string OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild);
+    // True while keystrokes must be ignored: protection is on AND either
+    // a password field has focus or a focus check is still pending (fail
+    // closed between a focus change and the worker's verdict).
+    bool IsSecureFieldActive();
 
-    // Background UI Automation worker that re-evaluates whatever has
-    // keyboard focus (UIA IsPassword + Win32 ES_PASSWORD).  It is the
-    // only place that turns protection OFF.  After each check it posts
-    // |notifyMsg| to |notifyHwnd|; LastFocusCheck() describes the result.
+    // EVENT_OBJECT_FOCUS: remember the target and schedule a check.
+    // Cheap, no cross-process calls (safe on the hook thread).
+    void OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild);
+
+    // Background worker (MTA) that evaluates the focused element with
+    // UIA IsPassword, MSAA STATE_SYSTEM_PROTECTED and Win32 ES_PASSWORD.
+    // When the verdict changes it posts |notifyMsg| (wParam = 1 secure,
+    // 0 not) to |notifyHwnd|.
     void StartFocusWorker(HWND notifyHwnd, UINT notifyMsg);
     void RequestFocusCheck();          // cheap; safe from any thread
     void StopFocusWorker();
-    std::string LastFocusCheck();
 
     // ── Update verification helpers ───────────────────────────
     // Hosts the updater may talk to (exact match, HTTPS only).
