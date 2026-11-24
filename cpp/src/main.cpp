@@ -1256,6 +1256,14 @@ static void CALLBACK WinEventProc(
 {
     if (event == EVENT_OBJECT_FOCUS) {
         // Track whether keyboard focus is on a password field.
+        // Ignore focus events from windows outside the foreground app
+        // (e.g. the shell's transient "ForegroundStaging" window during
+        // a switch) — they would wrongly clear the flag.  Re-check soon.
+        HWND root = hwnd ? GetAncestor(hwnd, GA_ROOT) : nullptr;
+        if (!root || root != GetForegroundWindow()) {
+            ScheduleSecureFieldRefresh();
+            return;
+        }
         LogSecureFieldChange(Security::OnFocusEvent(hwnd, idObject, idChild));
         return;
     }
@@ -3025,7 +3033,9 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_TIMER:
         if (wParam == TIMER_SECURE_REFRESH) {
             KillTimer(hwnd, TIMER_SECURE_REFRESH);   // one-shot
-            LogSecureFieldChange(Security::RefreshFocus());
+            std::string why = Security::RefreshFocus();
+            Dbg("SECURE-CHECK: %s", why.c_str());
+            LogSecureFieldChange(why);
             return 0;
         }
         // Periodic cleanup of closed windows from the tracker
