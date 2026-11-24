@@ -101,7 +101,7 @@ static Theme MakeTheme(bool dark, bool translucent) {
     t.dark = dark;
     t.accent = Rgb(AccentRgb(dark));
     if (dark) {
-        t.bg         = translucent ? Rgb(0x202020, 0.0f) : Rgb(0x202020);
+        t.bg         = translucent ? Rgb(0x202020, 0.80f) : Rgb(0x202020);
         t.card       = Rgb(0xFFFFFF, 0.05f);
         t.cardStroke = Rgb(0x000000, 0.10f);
         t.text       = Rgb(0xFFFFFF);
@@ -115,8 +115,8 @@ static Theme MakeTheme(bool dark, bool translucent) {
         t.thumb      = Rgb(0x454545);
         t.track      = Rgb(0xFFFFFF, 0.54f);
     } else {
-        t.bg         = translucent ? Rgb(0xF3F3F3, 0.0f) : Rgb(0xF3F3F3);
-        t.card       = Rgb(0xFFFFFF, 0.70f);
+        t.bg         = translucent ? Rgb(0xF3F3F3, 0.85f) : Rgb(0xF3F3F3);
+        t.card       = Rgb(0xFFFFFF, 0.88f);
         t.cardStroke = Rgb(0x000000, 0.06f);
         t.text       = Rgb(0x000000, 0.90f);
         t.text2      = Rgb(0x000000, 0.61f);
