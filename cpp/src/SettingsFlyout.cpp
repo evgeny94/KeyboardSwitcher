@@ -75,12 +75,6 @@ static bool SystemUsesDarkTheme() {
         L"AppsUseLightTheme", 1) == 0;
 }
 
-static bool TransparencyEnabled() {
-    return RegDword(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"EnableTransparency", 1) != 0;
-}
-
 // Accent as Windows 11 uses it on controls: a lighter shade in dark mode,
 // a darker one in light mode (AccentPalette), falling back to the default blue.
 static UINT32 AccentRgb(bool dark) {
@@ -96,14 +90,14 @@ static UINT32 AccentRgb(bool dark) {
     return dark ? 0x60CDFF : 0x005FB8;
 }
 
-static Theme MakeTheme(bool dark, bool translucent) {
+static Theme MakeTheme(bool dark) {
     Theme t;
     t.dark = dark;
     t.accent = Rgb(AccentRgb(dark));
     if (dark) {
-        t.bg         = translucent ? Rgb(0x202020, 0.80f) : Rgb(0x202020);
-        t.card       = Rgb(0xFFFFFF, 0.05f);
-        t.cardStroke = Rgb(0x000000, 0.10f);
+        t.bg         = Rgb(0x1C1C1C);
+        t.card       = Rgb(0x2B2B2B);
+        t.cardStroke = Rgb(0xFFFFFF, 0.08f);
         t.text       = Rgb(0xFFFFFF);
         t.text2      = Rgb(0xFFFFFF, 0.79f);
         t.text3      = Rgb(0xFFFFFF, 0.36f);
@@ -115,9 +109,9 @@ static Theme MakeTheme(bool dark, bool translucent) {
         t.thumb      = Rgb(0x454545);
         t.track      = Rgb(0xFFFFFF, 0.54f);
     } else {
-        t.bg         = translucent ? Rgb(0xF3F3F3, 0.85f) : Rgb(0xF3F3F3);
-        t.card       = Rgb(0xFFFFFF, 0.88f);
-        t.cardStroke = Rgb(0x000000, 0.06f);
+        t.bg         = Rgb(0xEEEEEE);
+        t.card       = Rgb(0xFFFFFF);
+        t.cardStroke = Rgb(0x000000, 0.08f);
         t.text       = Rgb(0x000000, 0.90f);
         t.text2      = Rgb(0x000000, 0.61f);
         t.text3      = Rgb(0x000000, 0.36f);
@@ -193,17 +187,20 @@ static Layout BuildLayout() {
                         {pad, y, pad + cw, y + 18}, Font::Caption, false, true});
     y += 30;
 
-    // ── Languages ──
+    // ── Languages (card) ──
     L.labels.push_back({L"LANGUAGES", {pad, y, pad + cw, y + 16}, Font::Section, false, true});
     y += 22;
     {
-        const float gap = 8, w = (cw - 2 * gap) / 3;
+        const float ip = 12, x0 = pad + ip, iw = cw - 2 * ip;
+        const float gap = 8, w = (iw - 2 * gap) / 3;
+        const float top = y;
+        y += ip;
         std::wstring missing;
         for (int i = 0; i < LangAvail::kNumLangs; ++i) {
             const std::string l = LangAvail::kLangs[i];
             bool installed = LangAvail::IsInstalled(l);
             bool shown     = LangShown(l);
-            D2D1_RECT_F r  = {pad + i * (w + gap), y, pad + i * (w + gap) + w, y + 32};
+            D2D1_RECT_F r  = {x0 + i * (w + gap), y, x0 + i * (w + gap) + w, y + 32};
             std::wstring tip = shown
                 ? std::wstring(L"Include ") + LangName(l) +
                   L" in detection. When off, text is never converted to or from " + LangName(l) + L"."
@@ -216,26 +213,22 @@ static Layout BuildLayout() {
                 missing += LangName(l);
             }
         }
-        y += 40;
-        if (!missing.empty()) {
-            L.labels.push_back({missing + L": no layout installed",
-                                {pad, y, pad + cw - 160, y + 18}, Font::Caption, false, true});
-        } else {
-            L.labels.push_back({L"All supported layouts are installed.",
-                                {pad, y, pad + cw - 160, y + 18}, Font::Caption, false, true});
-        }
-        // Auto-exclude toggle sits at the right of that caption line.
-        L.labels.push_back({L"Skip missing", {pad + cw - 150, y, pad + cw - 50, y + 18},
+        y += 32 + 10;
+        L.labels.push_back({missing.empty() ? std::wstring(L"All supported layouts are installed.")
+                                            : missing + L": no layout installed",
+                            {x0, y, x0 + iw - 150, y + 20}, Font::Caption, false, true});
+        // Auto-exclude toggle at the right of the caption line.
+        L.labels.push_back({L"Skip missing", {x0 + iw - 150, y, x0 + iw - 50, y + 20},
                             Font::Caption, false, true, DWRITE_TEXT_ALIGNMENT_TRAILING});
-        L.items.push_back({Kind::AutoExclude, 0, {pad + cw - 40, y - 1, pad + cw, y + 19}, true,
+        L.items.push_back({Kind::AutoExclude, 0, {x0 + iw - 40, y, x0 + iw, y + 20}, true,
                            L"Automatically exclude languages whose keyboard layout is not installed "
                            L"(recommended). Turn off only if you add layouts on the fly."});
-        y += 30;
+        y += 20 + ip;
+        L.cards.push_back({pad, top, pad + cw, y});
+        y += 16;
     }
 
-    // ── Directions ──
-    L.seps.push_back(y);
-    y += 12;
+    // ── Directions (one card each) ──
     L.labels.push_back({L"DIRECTIONS", {pad, y, pad + cw, y + 16}, Font::Section, false, true});
     y += 22;
     int shownDirs = 0;
@@ -288,24 +281,26 @@ static Layout BuildLayout() {
         y += 26;
     }
 
-    // ── Short text ──
-    y += 4;
-    L.seps.push_back(y);
-    y += 12;
+    // ── Short words (card) ──
+    y += 8;
     L.labels.push_back({L"SHORT WORDS", {pad, y, pad + cw, y + 16}, Font::Section, false, true});
-    y += 20;
-    L.labels.push_back({L"Confidence required at minimum length (all directions)",
-                        {pad, y, pad + cw, y + 18}, Font::Caption, false, true});
-    y += 20;
+    y += 22;
     {
-        L.items.push_back({Kind::ShortConf, 0, {pad, y, pad + cw - 48, y + 26}, true,
+        const float ip = 14, x0 = pad + ip, x1 = pad + cw - ip;
+        const float top = y;
+        L.labels.push_back({L"Confidence required at minimum length (all directions)",
+                            {x0, y + 10, x1, y + 28}, Font::Caption, false, true});
+        const float sy = y + 32;
+        L.items.push_back({Kind::ShortConf, 0, {x0, sy, x1 - 48, sy + 26}, true,
                            L"Confidence needed when only the minimum number of letters has been "
                            L"typed. It relaxes linearly towards each direction's floor."});
         wchar_t buf[16];
         swprintf(buf, 16, L"%.2f", Config::DefaultParams.ConfidenceAtMinChars);
-        L.labels.push_back({buf, {pad + cw - 44, y, pad + cw, y + 26}, Font::BodyStrong, false, false,
+        L.labels.push_back({buf, {x1 - 44, sy, x1, sy + 26}, Font::BodyStrong, false, false,
                             DWRITE_TEXT_ALIGNMENT_TRAILING});
-        y += 38;
+        y = sy + 26 + 10;
+        L.cards.push_back({pad, top, pad + cw, y});
+        y += 16;
     }
 
     // ── Footer ──
@@ -496,7 +491,13 @@ static void Draw(ID2D1RenderTarget* rt, const Layout& L, const Theme& th,
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
     };
 
-    for (const auto& c : L.cards) { fill(c, 6, th.card); stroke(c, 6, th.cardStroke); }
+    for (const auto& c : L.cards) {
+        const float sh = th.dark ? 0.35f : 0.06f;
+        fill({c.left, c.top + 2, c.right, c.bottom + 2}, 8, D2D1::ColorF(0x000000, sh * 0.6f));
+        fill({c.left, c.top + 1, c.right, c.bottom + 1}, 8, D2D1::ColorF(0x000000, sh));
+        fill(c, 8, th.card);
+        stroke(c, 8, th.cardStroke);
+    }
     for (float y : L.seps) {
         br->SetColor(th.sep);
         rt->DrawLine(D2D1::Point2F(16, y), D2D1::Point2F(kWidth - 16, y), br, 1.0f);
@@ -621,7 +622,6 @@ struct FlyoutState {
     HWND       hwnd     = nullptr;
     HWND       tip      = nullptr;
     float      scale    = 1.0f;
-    bool       backdrop = false;
     Theme      theme;
     Layout     layout;
     PaintState ps;
@@ -683,16 +683,8 @@ static void ApplyDwmStyle(HWND hwnd) {
     int corner = 2;   // DWMWCP_ROUND
     DwmSetWindowAttribute(hwnd, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, &corner, sizeof(corner));
 
-    g_fly.backdrop = false;
-    if (TransparencyEnabled()) {
-        int backdrop = 3; // DWMSBT_TRANSIENTWINDOW (acrylic, as used by Win11 flyouts)
-        if (SUCCEEDED(DwmSetWindowAttribute(hwnd, 38 /*DWMWA_SYSTEMBACKDROP_TYPE*/,
-                                            &backdrop, sizeof(backdrop)))) {
-            MARGINS m = {-1, -1, -1, -1};
-            g_fly.backdrop = SUCCEEDED(DwmExtendFrameIntoClientArea(hwnd, &m));
-        }
-    }
-    g_fly.theme = MakeTheme(dark, g_fly.backdrop);
+    // Solid background by design (an acrylic backdrop looked washed out).
+    g_fly.theme = MakeTheme(dark);
 }
 
 // Resize to the current layout; the bottom edge stays anchored (the
@@ -910,7 +902,7 @@ void Toggle(HWND owner) {
 bool RenderToBitmapFile(const std::wstring& path, bool dark, float scale) {
     g_noPersist = true;
     Layout L = BuildLayout();
-    Theme th = MakeTheme(dark, /*translucent=*/false);
+    Theme th = MakeTheme(dark);
     int w = static_cast<int>(std::ceil(kWidth * scale));
     int h = static_cast<int>(std::ceil(L.height * scale));
     HDC screen = GetDC(nullptr);

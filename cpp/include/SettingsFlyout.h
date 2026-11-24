@@ -8,7 +8,7 @@
 //
 // Custom-drawn with Direct2D / DirectWrite (system DLLs only):
 // follows the system light/dark theme and accent colour, uses Win11
-// rounded corners + acrylic backdrop via DWM where available, Segoe UI
+// solid background with raised cards, Win11 rounded corners via DWM, Segoe UI
 // Variable, and per-monitor-v2 DPI scaling (set per thread, so the rest
 // of the process keeps its DPI mode).
 //

@@ -233,6 +233,19 @@ set(CPACK_NSIS_MUI_ICON "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico")
 set(CPACK_NSIS_MUI_UNIICON "${CMAKE_CURRENT_SOURCE_DIR}/keyboard.ico")
 set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
 
+# Close a running KeyboardSwitcher before files are replaced (and before
+# uninstall), instead of failing with "file in use".  Polite close first,
+# then force after a second if it is still running.
+set(KS_NSIS_CLOSE_APP
+    "nsExec::Exec '$SYSDIR\\\\taskkill.exe /IM KeyboardSwitcher.exe'
+  Pop $0
+  Sleep 1000
+  nsExec::Exec '$SYSDIR\\\\taskkill.exe /F /IM KeyboardSwitcher.exe'
+  Pop $0
+  Sleep 500")
+set(CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}")
+set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}")
+
 # Start-menu shortcut
 set(CPACK_NSIS_CREATE_ICONS_EXTRA
     "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Keyboard Switcher.lnk' '$INSTDIR\\\\KeyboardSwitcher.exe'")

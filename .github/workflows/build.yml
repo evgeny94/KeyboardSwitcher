@@ -89,6 +89,12 @@ jobs:
           Get-ChildItem KeyboardSwitcher-*-win64.* | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
           } | Tee-Object -FilePath SHA256SUMS.txt
+          # The installer must close a running copy before replacing files.
+          $nsi = Get-ChildItem -Recurse _CPack_Packages -Filter project.nsi | Select-Object -First 1
+          Select-String -Path $nsi.FullName -Pattern 'taskkill' | ForEach-Object { $_.Line.Trim() }
+          if (-not (Select-String -Path $nsi.FullName -Pattern 'taskkill.exe /F /IM KeyboardSwitcher.exe' -Quiet)) {
+            throw "installer is missing the close-running-app step"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
