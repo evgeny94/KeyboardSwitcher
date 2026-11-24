@@ -2574,6 +2574,8 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_DEBUG_LOG:
             DbgSetEnabled(!g_debugLogEnabled);
+            Security::DebugLogOnStartup.store(g_debugLogEnabled);   // remembered across restarts
+            Security::SaveSettings();
             if (g_debugLogEnabled) {
                 Dbg("=== Debug logging enabled (v%s) ===",
                     std::string(Config::VERSION,
@@ -2596,6 +2598,8 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             break;
         case ID_TRAY_COLLECT_FEEDBACK:
             Feedback::SetLoggingEnabled(!Feedback::LoggingEnabled.load());
+            Security::CollectFeedback.store(Feedback::LoggingEnabled.load());
+            Security::SaveSettings();
             break;
         case ID_TRAY_PROTECT_SECURE:
             if (Security::ProtectSecureFields.load()) {
@@ -2785,6 +2789,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     // Privacy / security settings (settings.json; secure defaults)
     Security::LoadSettings();
+
+    // Diagnostics remembered in settings.json (user_prefs.json is reset on
+    // every version change, so it cannot hold these).  Starting with
+    // --debug-log, or an existing user_prefs.json opt-in, is remembered too;
+    // turning either off in the tray menu saves "off".
+    {
+        bool changed = false;
+        if (g_debugLogEnabled && !Security::DebugLogOnStartup.load()) {
+            Security::DebugLogOnStartup.store(true); changed = true;
+        }
+        if (Feedback::LoggingEnabled.load() && !Security::CollectFeedback.load()) {
+            Security::CollectFeedback.store(true); changed = true;
+        }
+        if (changed) Security::SaveSettings();
+        if (Security::DebugLogOnStartup.load() && !g_debugLogEnabled) {
+            DbgSetEnabled(true);
+            Dbg("=== Debug logging enabled from settings.json ===");
+        }
+        if (Security::CollectFeedback.load())
+            Feedback::LoggingEnabled.store(true);
+    }
 
     // Seed focus-tracking globals so the first keystroke doesn't
     // trigger a spurious HandleFocusChange.

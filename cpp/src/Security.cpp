@@ -28,6 +28,8 @@ std::atomic<bool> ProtectSecureFields{true};
 std::atomic<bool> RedactDebugLog{true};
 std::atomic<bool> CheckUpdatesOnStartup{true};
 std::atomic<bool> RequireVerifiedUpdates{true};
+std::atomic<bool> DebugLogOnStartup{false};
+std::atomic<bool> CollectFeedback{false};
 std::atomic<bool> SecureFieldFocused{false};
 
 // ── settings.json ────────────────────────────────────────────
@@ -54,6 +56,8 @@ void LoadSettings() {
         flag("redact_debug_log",         RedactDebugLog);
         flag("check_updates_on_startup", CheckUpdatesOnStartup);
         flag("require_verified_updates", RequireVerifiedUpdates);
+        flag("debug_log",                DebugLogOnStartup);
+        flag("collect_feedback",         CollectFeedback);
         LangAvail::FromJson(j);
     } catch (...) {
         // Corrupt file — keep secure defaults
@@ -68,6 +72,8 @@ void SaveSettings() {
     j["redact_debug_log"]         = RedactDebugLog.load();
     j["check_updates_on_startup"] = CheckUpdatesOnStartup.load();
     j["require_verified_updates"] = RequireVerifiedUpdates.load();
+    j["debug_log"]                = DebugLogOnStartup.load();
+    j["collect_feedback"]         = CollectFeedback.load();
     LangAvail::ToJson(j);
     // Write a temp file and swap it in: a crash never leaves a truncated
     // settings.json (which would silently reset everything to defaults).

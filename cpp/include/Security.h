@@ -28,6 +28,11 @@ namespace Security {
     extern std::atomic<bool> RedactDebugLog;
     extern std::atomic<bool> CheckUpdatesOnStartup;
     extern std::atomic<bool> RequireVerifiedUpdates;
+    // Diagnostics that survive restarts (both default off):
+    //   "debug_log":        write ks_debug.log from startup
+    //   "collect_feedback": append outcomes to feedback.jsonl
+    extern std::atomic<bool> DebugLogOnStartup;
+    extern std::atomic<bool> CollectFeedback;
 
     // Load settings.json (missing / corrupt file → secure defaults).
     void LoadSettings();
