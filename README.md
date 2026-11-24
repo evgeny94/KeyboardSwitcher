@@ -502,7 +502,7 @@ Keyboard Switcher sees every keystroke (it has to, to detect the language), so i
 
 Updater hardening (always on): HTTPS only, downloads restricted to GitHub hosts (`github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`) including after redirects, no HTTPS→HTTP redirect downgrade, HTTP 200 required.
 
-**Reproducible builds:** `.github/workflows/build.yml` builds the ZIP + NSIS installer on GitHub Actions from the public source, checks that the bundled `onnxruntime.dll` is Microsoft-signed, and publishes `SHA256SUMS.txt` with the artifacts.
+**Reproducible builds:** `.github/workflows/build.yml` builds the ZIP + NSIS installer on GitHub Actions from the public source, fetches ONNX Runtime from Microsoft's official NuGet package, checks that `onnxruntime.dll` is Microsoft-signed, and publishes `SHA256SUMS.txt` with the artifacts.
 
 ## Usage
 

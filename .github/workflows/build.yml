@@ -21,16 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch ONNX Runtime ${{ env.ORT_VERSION }} (official Microsoft release)
+      - name: Fetch ONNX Runtime ${{ env.ORT_VERSION }} (official Microsoft NuGet package)
         shell: pwsh
         run: |
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/onnxruntime-win-x64-$env:ORT_VERSION.zip"
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$env:ORT_VERSION/microsoft.ml.onnxruntime.$env:ORT_VERSION.nupkg"
           Invoke-WebRequest $url -OutFile ort.zip
-          Write-Host "ORT zip SHA-256: $((Get-FileHash ort.zip).Hash)"
+          Write-Host "ORT nupkg SHA-256: $((Get-FileHash ort.zip).Hash)"
           Expand-Archive ort.zip -DestinationPath ort
-          $root = Get-ChildItem ort -Directory | Select-Object -First 1
           New-Item -ItemType Directory -Force cpp/onnxruntime/lib | Out-Null
-          Copy-Item "$($root.FullName)/lib/*" cpp/onnxruntime/lib/ -Recurse -Force
+          Copy-Item "ort/runtimes/win-x64/native/*" cpp/onnxruntime/lib/ -Force
           # Refuse to ship an onnxruntime.dll that is not Microsoft-signed
           $sig = Get-AuthenticodeSignature cpp/onnxruntime/lib/onnxruntime.dll
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
