@@ -74,6 +74,7 @@ set(SOURCES
     src/FeedbackLogger.cpp
     src/Triage.cpp
     src/Security.cpp
+    src/LangAvail.cpp
 )
 
 set(HEADERS
@@ -85,6 +86,7 @@ set(HEADERS
     include/FeedbackLogger.h
     include/Triage.h
     include/Security.h
+    include/LangAvail.h
     resources/resource.h
 )
 

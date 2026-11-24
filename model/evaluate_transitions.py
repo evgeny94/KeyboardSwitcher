@@ -106,6 +106,23 @@ def load_vocab(lang: str, sample: int, seed: int, min_len: int, max_len: int) ->
     return rng.sample(words, min(sample, len(words)))
 
 
+def _renormalise(scores, enabled):
+    """Drop disabled classes from a softmax vector and renormalise.
+
+    Mirrors RenormaliseScores() in cpp/src/Languages.cpp.  Returns
+    (lang, conf, scores) with lang=None when N/A wins."""
+    s = [float(scores[0])] + [float(scores[i]) if _CLASS_LANG[i] in enabled else 0.0
+                              for i in (1, 2, 3)]
+    tot = sum(s)
+    if tot <= 0.0:
+        return None, 0.0, [0.0, 0.0, 0.0, 0.0]
+    s = [x / tot for x in s]
+    best = max((1, 2, 3), key=lambda i: s[i])
+    if s[0] > s[best]:
+        return None, 0.0, s
+    return _CLASS_LANG[best], s[best], s
+
+
 def required_confidence(n: int, params, is_phrase: bool = False) -> float:
     early_min, full_conf, conf_min, conf_max = params[0], params[1], params[2], params[3]
     phrase_scale = params[8]
@@ -127,7 +144,14 @@ def evaluate_pair(
     to_lang: str,
     model_args: list,
     triage=None,
+    enabled=None,
+    renorm: bool = True,
 ) -> Tuple[int, int, int, int]:
+    # enabled: languages that are usable (installed + user-enabled), mirroring
+    # LangAvail in cpp/src/LangAvail.cpp.  Disabled languages get no conversion
+    # variant and their softmax mass is removed (scores renormalised over the
+    # remaining classes) so they no longer dilute top-1 / margin / incumbent.
+    enabled = set(enabled or LANGS)
     params = PAIR_OVERRIDES.get((from_lang, to_lang), DEFAULT_PARAMS)
     he_params       = PAIR_OVERRIDES.get((from_lang, "he"), DEFAULT_PARAMS)
     he_virtual_conf = he_params[9]
@@ -186,7 +210,7 @@ def evaluate_pair(
             variants.append(text[:n])
             seen.add(text[:n])
             for other_lang, dst_layout in LAYOUTS.items():
-                if other_lang == current_lang:
+                if other_lang == current_lang or other_lang not in enabled:
                     continue
                 variant = convert_text_bidirectional(text[:n], cur_layout, dst_layout)
                 if variant not in seen:
@@ -211,6 +235,8 @@ def evaluate_pair(
                         lang, conf, scores = None, 0.0, [0.0, 0.0, 0.0, 0.0]
                     else:
                         lang, conf, scores = result.language, result.confidence, result.scores
+                        if renorm and len(enabled) < len(LANGS):
+                            lang, conf, scores = _renormalise(scores, enabled)
                     predict_cache[variant] = (lang, conf, scores)
 
                 # Hebrew script coverage gate (→he pairs only)
@@ -349,7 +375,14 @@ def main() -> None:
     parser.add_argument("--triage-fuzzy", action="store_true",
                         help="Also enable the BK-tree fuzzy component (off by default; "
                              "tuning showed it costs TP on dense lexicons)")
+    parser.add_argument("--langs", default=",".join(LANGS),
+                        help="Comma-separated enabled languages (e.g. en,he). "
+                             "Disabled ones are excluded as candidates/variants "
+                             "and their softmax mass is renormalised away.")
+    parser.add_argument("--no-renorm", action="store_true",
+                        help="With --langs: exclude only, do not renormalise")
     args = parser.parse_args()
+    enabled = [l.strip() for l in args.langs.split(",") if l.strip()]
 
     triage = None
     if args.triage or args.triage_lsh:
@@ -367,12 +400,13 @@ def main() -> None:
     }
 
     print("\nResults (all directed transitions):")
-    for from_lang in LANGS:
-        for to_lang in LANGS:
+    for from_lang in enabled:
+        for to_lang in enabled:
             if from_lang == to_lang:
                 continue
             tp, tp_total, fp, fp_total = evaluate_pair(
-                words_by_lang, from_lang, to_lang, model_args, triage=triage)
+                words_by_lang, from_lang, to_lang, model_args, triage=triage,
+                enabled=enabled, renorm=not args.no_renorm)
             print(
                 f"{from_lang}->{to_lang}: "
                 f"TP {tp}/{tp_total} ({tp/tp_total:.3f}), "

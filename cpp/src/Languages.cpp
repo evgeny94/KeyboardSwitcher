@@ -433,6 +433,24 @@ static const char* kClassLang[4] = { "", "en", "he", "ru" };
 // ============================================================
 // Typo-resilient detection
 // ============================================================
+bool RenormaliseScores(DetectionResult& r, const std::set<std::string>& disabledLangs) {
+    float sum = r.scores[0];
+    for (int i = 1; i < 4; ++i) {
+        if (disabledLangs.count(kClassLang[i])) r.scores[i] = 0.0f;
+        sum += r.scores[i];
+    }
+    if (sum <= 0.0f) return false;
+    int best = 0;
+    for (int i = 0; i < 4; ++i) {
+        r.scores[i] /= sum;
+        if (i > 0 && r.scores[i] > r.scores[best]) best = i;
+    }
+    if (best == 0 || r.scores[0] > r.scores[best]) return false;   // N/A wins
+    r.language   = kClassLang[best];
+    r.confidence = r.scores[best];
+    return true;
+}
+
 std::optional<DetectionResult> TypoResilientDetect(
     LanguageDetector& detector,
     const std::vector<std::wstring>& textVariants,
@@ -440,8 +458,22 @@ std::optional<DetectionResult> TypoResilientDetect(
     size_t numChars,
     DetectionHistory& history,
     const std::set<std::string>& excludedLangs,
-    bool isFallback)
+    bool isFallback,
+    const std::set<std::string>& disabledLangs)
 {
+    // Disabled languages (layout not installed / turned off by the user) are
+    // excluded like excludedLangs AND have their softmax mass removed, so
+    // they no longer dilute confidence, margin or the incumbent signal of
+    // the remaining languages.
+    std::set<std::string> excl = excludedLangs;
+    excl.insert(disabledLangs.begin(), disabledLangs.end());
+    auto predict = [&](const std::wstring& v) -> std::optional<DetectionResult> {
+        auto r = detector.PredictLanguageWithConfidence(v);
+        if (r && !disabledLangs.empty() && !RenormaliseScores(*r, disabledLangs))
+            return std::nullopt;
+        return r;
+    };
+
     // isFallback is now an explicit parameter.
     // excludedLangs may be non-empty even on a primary (non-fallback) call
     // (e.g. case-signal Hebrew exclusion) — history gate still applies.
@@ -469,13 +501,13 @@ std::optional<DetectionResult> TypoResilientDetect(
     std::wstring heScriptVariant;
 
     for (const auto& variant : textVariants) {
-        auto result = detector.PredictLanguageWithConfidence(variant);
+        auto result = predict(variant);
 
         // ── Hebrew script coverage check (parallel to ONNX) ──────────
         if (Config::EnableHebrewScriptGate &&
             heParams.HebrewScriptVirtualConf > 0.0f &&
             currentLang != "he" &&
-            !excludedLangs.count("he"))
+            !excl.count("he"))
         {
             float coverage = ComputeHebrewScriptCoverage(variant);
             if (coverage >= heParams.HebrewScriptCoverageThreshold) {
@@ -508,7 +540,7 @@ std::optional<DetectionResult> TypoResilientDetect(
             int   candIdx  = 0;
             float candConf = 0.0f;
             for (int i = 1; i < 4; ++i) {
-                if (excludedLangs.count(kClassLang[i])) continue;
+                if (excl.count(kClassLang[i])) continue;
                 if (result->scores[i] > candConf) {
                     candConf = result->scores[i];
                     candIdx  = i;
@@ -544,7 +576,7 @@ std::optional<DetectionResult> TypoResilientDetect(
     float       runnerUpConf = 0.0f;
     for (int i = 1; i < 4; ++i) {
         const std::string cls = kClassLang[i];
-        if (cls == bestLang || excludedLangs.count(cls)) continue;
+        if (cls == bestLang || excl.count(cls)) continue;
         if (bestFullResult.scores[i] > runnerUpConf) {
             runnerUpConf = bestFullResult.scores[i];
             runnerUpLang = cls;
@@ -646,7 +678,7 @@ std::optional<DetectionResult> TypoResilientDetect(
             ++dropIters;
             std::wstring dropped = bestVariant.substr(0, i)
                                  + bestVariant.substr(i + 1);
-            auto res = detector.PredictLanguageWithConfidence(dropped);
+            auto res = predict(dropped);
             if (res.has_value() &&
                 res->language == bestLang &&
                 res->confidence > bestConf)
@@ -658,7 +690,7 @@ std::optional<DetectionResult> TypoResilientDetect(
                 float ru = 0.0f;
                 for (int i = 1; i < 4; ++i) {
                     const std::string cls = kClassLang[i];
-                    if (cls == bestLang || excludedLangs.count(cls)) continue;
+                    if (cls == bestLang || excl.count(cls)) continue;
                     if (res->scores[i] > ru) ru = res->scores[i];
                 }
                 runnerUpConf   = ru;

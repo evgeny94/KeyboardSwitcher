@@ -4,6 +4,7 @@
 
 #include "Security.h"
 #include "FeedbackLogger.h"
+#include "LangAvail.h"
 
 #include <windows.h>
 #include <oleacc.h>
@@ -48,6 +49,7 @@ void LoadSettings() {
         RedactDebugLog.store(j.value("redact_debug_log", true));
         CheckUpdatesOnStartup.store(j.value("check_updates_on_startup", true));
         RequireVerifiedUpdates.store(j.value("require_verified_updates", true));
+        LangAvail::FromJson(j);
     } catch (...) {
         // Corrupt file — keep secure defaults
     }
@@ -61,6 +63,7 @@ void SaveSettings() {
     j["redact_debug_log"]         = RedactDebugLog.load();
     j["check_updates_on_startup"] = CheckUpdatesOnStartup.load();
     j["require_verified_updates"] = RequireVerifiedUpdates.load();
+    LangAvail::ToJson(j);
     std::ofstream out(path.c_str(), std::ios::trunc);
     if (out.is_open()) out << j.dump(2);
 }

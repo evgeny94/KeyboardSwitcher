@@ -37,6 +37,7 @@
 #include "FeedbackLogger.h"
 #include "Triage.h"
 #include "Security.h"
+#include "LangAvail.h"
 #include "../resources/resource.h"
 
 // ============================================================
@@ -1022,38 +1023,19 @@ static size_t GetWindowContextHash(HWND hwnd) {
 
 
 // ============================================================
-// Helper: find the actual installed HKL for a language
-// ============================================================
-static HKL FindInstalledHKL(const std::string& lang) {
-    // Get the target LANGID
-    LANGID targetLangId = 0;
-    for (const auto& [id, name] : Config::LANGUAGE_ID) {
-        if (name == lang) { targetLangId = id; break; }
-    }
-    if (targetLangId == 0)
-        return Config::GetHKLFromLanguage(lang); // fallback to hardcoded
-
-    // Enumerate actually installed keyboard layouts
-    int count = GetKeyboardLayoutList(0, nullptr);
-    if (count > 0) {
-        std::vector<HKL> layouts(count);
-        GetKeyboardLayoutList(count, layouts.data());
-        for (HKL h : layouts) {
-            if (LOWORD((DWORD_PTR)h) == targetLangId)
-                return h;
-        }
-    }
-    return Config::GetHKLFromLanguage(lang); // fallback
-}
-
-// ============================================================
 // Helper: change the foreground window keyboard layout
 // ============================================================
 static void ChangeKeyboardLayout(const std::string& lang) {
     HWND hwnd = GetForegroundWindow();
     if (!hwnd) return;
 
-    HKL hkl = FindInstalledHKL(lang);
+    // Never request a layout that is not installed: Windows would either
+    // ignore it or load a layout the user deliberately does not have.
+    HKL hkl = LangAvail::InstalledHKL(lang);
+    if (!hkl) {
+        Dbg("LAYOUT: no installed layout for %s, not switching", lang.c_str());
+        return;
+    }
 
     // Use SendMessage (synchronous) so the layout is guaranteed to
     // have changed by the time this function returns.
@@ -1103,6 +1085,7 @@ static void MaybeConfirmTP() {
 //              in a confirmed context — user may want to type in a
 //              different language now.
 static void HandleFocusChange(bool forceSearch = false) {
+    LangAvail::Refresh();   // pick up layouts added/removed in Settings
     if (g_isSendingInput.load()) return;
 
     HWND hwnd = GetForegroundWindow();
@@ -2017,6 +2000,15 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 alphaCount, detectionText.size(), Config::EarlyDetectionMinChars);
         }
 
+        // Language-pair control: a language whose layout is not installed or
+        // that the user disabled is never a source or a target.
+        if (!shouldSkip && !LangAvail::IsLangUsable(currentLangId)) {
+            shouldSkip = true;
+            Dbg("SKIP: skip_lang_disabled (current=%s)", currentLangId.c_str());
+        }
+        const std::set<std::string> disabledTargets =
+            shouldSkip ? std::set<std::string>{} : LangAvail::ExcludedTargets(currentLangId);
+
         if (!shouldSkip) {
             // ── Variant generation (source-restricted) ──────────────────
             // The text was physically typed on the CURRENT layout, so the
@@ -2037,7 +2029,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             // Identity: the text exactly as typed (detects "no switch needed").
             textVariants.push_back(detectionText);
             for (const char* o : otherLangs) {
-                if (currentLangId == o) continue;
+                if (currentLangId == o || disabledTargets.count(o)) continue;
                 const std::wstring& toLayout = Layouts::GetLayoutForLanguage(o);
                 if (HasLeakedLayoutChars(detectionText, curLayout, toLayout))
                     continue;   // skip lossy conversion
@@ -2121,7 +2113,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
             auto detection = TypoResilientDetect(
                 *g_detector, textVariants, currentLangId, alphaCount, g_history,
-                caseExcludedLangs, /*isFallback=*/false);
+                caseExcludedLangs, /*isFallback=*/false, disabledTargets);
 
             if (detection.has_value()) {
                 std::string bestLang = detection->language;  // copy — may be overridden
@@ -2138,7 +2130,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 // override the model and apply the learned direction.
                 if (currentLangId == bestLang) {
                     std::string overrideLang = Feedback::GetOverride(currentLangId, text);
-                    if (!overrideLang.empty()) {
+                    if (!overrideLang.empty() && !disabledTargets.count(overrideLang)) {
                         Dbg("OVERRIDE: learned %s→%s for %s",
                             currentLangId.c_str(), overrideLang.c_str(),
                             ws2s(text).c_str());
@@ -2231,7 +2223,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         excluded.insert(bestLang);
                         auto fallback = TypoResilientDetect(
                             *g_detector, textVariants, currentLangId, alphaCount,
-                            g_history, excluded, /*isFallback=*/true);
+                            g_history, excluded, /*isFallback=*/true, disabledTargets);
 
                         if (fallback.has_value() &&
                             fallback->language != currentLangId &&
@@ -3037,6 +3029,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_TIMER:
+        LangAvail::Refresh();
         // Periodic cleanup of closed windows from the tracker
         if (g_windows) {
             g_windows->Cleanup();

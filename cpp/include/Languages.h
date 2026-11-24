@@ -134,6 +134,10 @@ float ComputeHebrewScriptCoverage(const std::wstring& text);
 // language, looks up the (currentLang → bestLang) pair params to
 // determine the required confidence threshold and other settings.
 //
+// disabledLangs — languages whose layout is not installed or that the user
+//                 turned off (LangAvail::ExcludedTargets): excluded AND
+//                 renormalised away, see RenormaliseScores().
+//
 // excludedLangs — language codes (e.g. "he") to skip as candidates.
 //                 Used for case-signal exclusion (Hebrew excluded when
 //                 ALL-CAPS / internal capitals detected) and for the
@@ -152,5 +156,12 @@ std::optional<DetectionResult> TypoResilientDetect(
     size_t numChars,
     DetectionHistory& history,
     const std::set<std::string>& excludedLangs = {},
-    bool isFallback = false);
+    bool isFallback = false,
+    const std::set<std::string>& disabledLangs = {});
+
+// Drop the softmax mass of |disabledLangs| and renormalise the remaining
+// classes; updates language/confidence to the new argmax.  Returns false
+// when N/A becomes the top class.  Mirrors _renormalise() in
+// model/evaluate_transitions.py.
+bool RenormaliseScores(DetectionResult& r, const std::set<std::string>& disabledLangs);
 
