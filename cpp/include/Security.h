@@ -43,10 +43,14 @@ namespace Security {
     // Returns a short diagnostic (class / role / result — never text).
     std::string OnFocusEvent(HWND hwnd, LONG idObject, LONG idChild);
 
-    // Re-evaluate whatever currently has keyboard focus (Win32 focus
-    // HWND + MSAA accFocus walk).  Use after window switches / clicks,
-    // where focus events may arrive out of order or not at all.
-    std::string RefreshFocus();
+    // Background UI Automation worker that re-evaluates whatever has
+    // keyboard focus (UIA IsPassword + Win32 ES_PASSWORD).  It is the
+    // only place that turns protection OFF.  After each check it posts
+    // |notifyMsg| to |notifyHwnd|; LastFocusCheck() describes the result.
+    void StartFocusWorker(HWND notifyHwnd, UINT notifyMsg);
+    void RequestFocusCheck();          // cheap; safe from any thread
+    void StopFocusWorker();
+    std::string LastFocusCheck();
 
     // ── Update verification helpers ───────────────────────────
     // Hosts the updater may talk to (exact match, HTTPS only).

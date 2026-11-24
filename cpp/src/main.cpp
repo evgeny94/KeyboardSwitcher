@@ -176,6 +176,7 @@ static void Dbg(const char* fmt, ...) {
 // ============================================================
 #define WM_UPDATE_CHECK_RESULT  (WM_APP + 2)
 #define WM_UPDATE_DOWNLOAD_DONE (WM_APP + 3)
+#define WM_SECURE_CHECK_DONE    (WM_APP + 6)
 
 // Result of the version check (set by bg thread, read by UI thread)
 struct UpdateInfo {
@@ -1228,7 +1229,6 @@ static void HandleFocusChange(bool forceSearch = false) {
 // ============================================================
 // WinEvent callback — fired by the OS on foreground changes
 // ── Secure-field (password) tracking helpers ────────────────
-static constexpr UINT_PTR TIMER_SECURE_REFRESH = 2;
 static bool g_lastLoggedSecure = false;
 
 // Log only on/off transitions (diagnostics never include typed text).
@@ -1240,10 +1240,9 @@ static void LogSecureFieldChange(const std::string& why) {
     }
 }
 
-// Re-evaluate focus ~100 ms from now (after clicks / window switches).
+// Ask the UIA worker to re-check focus (after clicks / window switches).
 static void ScheduleSecureFieldRefresh() {
-    if (g_hwndHidden)
-        SetTimer(g_hwndHidden, TIMER_SECURE_REFRESH, 100, nullptr);
+    Security::RequestFocusCheck();
 }
 
 // ============================================================
@@ -2984,7 +2983,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     break;
             }
             Security::ProtectSecureFields.store(!Security::ProtectSecureFields.load());
-            LogSecureFieldChange(Security::RefreshFocus());
+            Security::RequestFocusCheck();
             Security::SaveSettings();
             break;
         case ID_TRAY_REDACT_DEBUG:
@@ -3026,18 +3025,18 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         HandleUpdateCheckResult();
         return 0;
 
+    case WM_SECURE_CHECK_DONE: {
+        std::string why = Security::LastFocusCheck();
+        Dbg("SECURE-CHECK: %s", why.c_str());
+        LogSecureFieldChange(why);
+        return 0;
+    }
+
     case WM_UPDATE_DOWNLOAD_DONE:
         HandleUpdateDownloadDone();
         return 0;
 
     case WM_TIMER:
-        if (wParam == TIMER_SECURE_REFRESH) {
-            KillTimer(hwnd, TIMER_SECURE_REFRESH);   // one-shot
-            std::string why = Security::RefreshFocus();
-            Dbg("SECURE-CHECK: %s", why.c_str());
-            LogSecureFieldChange(why);
-            return 0;
-        }
         // Periodic cleanup of closed windows from the tracker
         if (g_windows) {
             g_windows->Cleanup();
@@ -3193,7 +3192,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
         nullptr, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    LogSecureFieldChange(Security::RefreshFocus());
+    Security::StartFocusWorker(g_hwndHidden, WM_SECURE_CHECK_DONE);
+    Security::RequestFocusCheck();
 
     // Check for updates in the background (3-second delay so the app
     // starts up smoothly; silent if already on the latest version).
@@ -3210,6 +3210,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     // Cleanup
     if (g_winEventHook) UnhookWinEvent(g_winEventHook);
     if (g_focusEventHook) UnhookWinEvent(g_focusEventHook);
+    Security::StopFocusWorker();
     CoUninitialize();
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     if (g_mouseHook)    UnhookWindowsHookEx(g_mouseHook);
