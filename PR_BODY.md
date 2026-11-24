@@ -10,7 +10,7 @@ While focus is on a password field, keystrokes are not buffered, analysed, logge
 - Fail closed: from a focus change until the worker's verdict (typically < 50 ms) keys are treated as protected. A generation counter means a verdict computed before the latest focus change can never turn protection off, and a check where no API could answer keeps the previous verdict. UIA timeouts are capped at 1 s.
 - Re-checks also run after clicks and window switches. In testing, focus events from the shell's `ForegroundStaging` window during window switches otherwise cleared the flag while the password field was still focused.
 - Transitions are logged as `SECURE-FIELD: ON/OFF`, never with text.
-- Verified with the debug log (current version): Firefox and Edge (password field → `SECURE-FIELD: ON`, text field → no ON) and the Windows credential dialog (`Get-Credential`). Chrome and WinForms were verified on the earlier version. TODO before opening: re-check Chrome/WinForms and an Electron app (Discord).
+- Verified with the debug log on the current version: Chrome, Firefox and Edge (password ↔ text input inside one page), WinForms (`UseSystemPasswordChar` ↔ plain TextBox), Discord / Electron (search box vs. Change Password dialog) and the Windows credential dialog (`Get-Credential`). Each transition shows `SECURE-FIELD: ON/OFF` within about a second, and plain text fields never turn it on.
 
 **2. Redact typed text in the debug log (default on)**
 `ws2s()` in `main.cpp` is used only for logging. It now writes `<len=N>` instead of the text. You can turn it off when you need to debug detection.
