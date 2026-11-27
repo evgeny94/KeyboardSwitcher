@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <functional>
 #include <atomic>
@@ -715,6 +716,44 @@ static DWORD         g_lastCorrectionTick = 0;       // GetTickCount() at correc
 static std::string   g_lastCorrectionLang;            // language we switched TO
 static constexpr DWORD CORRECTION_GRACE_MS = 1000;    // 1 second grace period
 
+// Release time of the last modifier key (Shift/Alt/Ctrl/Win), reset by any
+// non-modifier keydown.  A manual layout switch (Alt+Shift, Win+Space, ...)
+// is only noticed on the NEXT keydown, possibly seconds later; a modifier
+// release with no ordinary key after it is the switch chord itself, so it
+// tells when the switch really happened.  Because ordinary keys reset it,
+// an unrelated earlier Shift (capital letter) or Ctrl (Ctrl+V) can never
+// back-date a later switch made with the mouse.
+static DWORD         g_lastModifierUpTick = 0;
+static bool          g_lastKeyWasBackspace = false;  // last ordinary keydown
+
+static bool IsModifierVk(DWORD vk) {
+    switch (vk) {
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+        case VK_MENU:  case VK_LMENU:  case VK_RMENU:
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        case VK_LWIN:  case VK_RWIN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// When the pending correction's layout switch-back actually happened:
+// the switch chord's release if it came after the correction, else `now`.
+static DWORD ManualSwitchTick(DWORD chordUpTick, DWORD now) {
+    if (g_lastCorrectionTick != 0 && chordUpTick != 0 &&
+        (chordUpTick - g_lastCorrectionTick) <= (now - g_lastCorrectionTick))
+        return chordUpTick;
+    return now;
+}
+
+// Rejection strikes for implicit (weak) rejections, keyed by
+// (corrected language, corrected text).  One weak rejection only nudges
+// calibration; the second for the same text makes it a permanent
+// exception.  In memory only: strikes reset on restart.
+static std::map<std::pair<std::string, std::wstring>, int> g_rejectionStrikes;
+static constexpr int REJECTION_STRIKES_FOR_EXCEPTION = 2;
+
 // ============================================================
 // Last correction state for Esc-to-undo
 // ============================================================
@@ -1095,19 +1134,57 @@ static void ChangeKeyboardLayout(const std::string& lang) {
 // g_lastCorrectionTick is zeroed after confirmation so the same
 // correction is never counted twice.
 // ============================================================
-static void MaybeConfirmTP() {
+// `now` is the reference time; the manual-switch path passes the moment the
+// switch really happened (ManualSwitchTick) rather than the next keydown.
+// `force` confirms before the window expires (the user visibly accepted it).
+static void MaybeConfirmTP(DWORD now = GetTickCount(), bool force = false) {
     if (!g_lastCorrection.valid)   return;
     if (g_lastCorrectionTick == 0) return;   // already confirmed or rejected
-    DWORD now = GetTickCount();
-    if ((now - g_lastCorrectionTick) < Feedback::SWITCH_AWAY_WINDOW_MS) return;
+    const DWORD elapsed = now - g_lastCorrectionTick;
+    if (!force && elapsed < Feedback::SWITCH_AWAY_FAST_MS) return;
     Feedback::RecordOutcome(g_lastCorrection.originalLang,
                              g_lastCorrection.correctedLang,
                              Feedback::Outcome::TruePositive);
     g_lastCorrectionTick = 0;  // prevent double-counting
-    Dbg("CALIB: tp_confirmed %s→%s conf=%.3f",
+    Dbg("CALIB: tp_confirmed %s→%s conf=%.3f elapsed=%lums",
         g_lastCorrection.originalLang.c_str(),
         g_lastCorrection.correctedLang.c_str(),
-        g_lastCorrection.confidence);
+        g_lastCorrection.confidence, (unsigned long)elapsed);
+}
+
+// The user moved on from the corrected text (click, paste, Enter, arrows...):
+// confirm the correction if its window expired, then close the rejection
+// window.  A layout switch after this is for new text, never a rejection
+// (Signal 1 requires g_lastCorrection.valid).
+static void InvalidateCorrection() {
+    MaybeConfirmTP();
+    g_lastCorrection.valid = false;
+}
+
+// Hebrew writes a foreign word after its prefix letters with a hyphen
+// (maqaf): "ה-word", "ל-facebook", "וב-Google".  When such text is typed on
+// the Hebrew layout, only the part after the hyphen is the foreign word; the
+// prefix is real Hebrew and must be neither scored nor converted (it would
+// become "v-word" / "k-facebook").  Returns the length of "<Hebrew>...<prefix>-"
+// to skip, or 0 when the cache does not look like that: everything before
+// the last hyphen must be Hebrew letters/spaces, the word right before it
+// must be 1-3 prefix letters (ו ה ב כ ל מ ש), and something must follow it.
+static size_t HebrewHyphenPrefixLen(const std::wstring& text) {
+    const size_t dash = text.rfind(L'-');
+    if (dash == std::wstring::npos || dash == 0 || dash + 1 >= text.size())
+        return 0;
+    for (size_t i = 0; i < dash; ++i) {
+        const wchar_t c = text[i];
+        if (c != L' ' && !(c >= 0x05D0 && c <= 0x05EA)) return 0;
+    }
+    size_t start = text.find_last_of(L' ', dash - 1);
+    start = (start == std::wstring::npos) ? 0 : start + 1;
+    const size_t len = dash - start;
+    if (len < 1 || len > 3) return 0;
+    static const std::wstring kPrefixLetters = L"\u05D5\u05D4\u05D1\u05DB\u05DC\u05DE\u05E9";
+    for (size_t i = start; i < dash; ++i)
+        if (kPrefixLetters.find(text[i]) == std::wstring::npos) return 0;
+    return dash + 1;
 }
 
 // ============================================================
@@ -1232,7 +1309,7 @@ static void HandleFocusChange(bool forceSearch = false) {
             g_cache.Clear();
             g_history.Clear();
             Config::SEARCH.store(true);
-            g_lastCorrection.valid = false;
+            InvalidateCorrection();   // moved on: closes rejection window
             UpdateTrayIconState();
             Dbg("FORCE-SEARCH: click in same context, SEARCH=1");
         } else {
@@ -1518,11 +1595,26 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if (pKb->flags & LLKHF_INJECTED)
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
 
-    // Only process key-down events
-    if (wParam != WM_KEYDOWN && wParam != WM_SYSKEYDOWN)
+    // Only process key-down events (but stamp modifier releases first, so a
+    // manual layout switch is timed when it happens — see ManualSwitchTick).
+    if (wParam != WM_KEYDOWN && wParam != WM_SYSKEYDOWN) {
+        if (IsModifierVk(pKb->vkCode))
+            g_lastModifierUpTick = GetTickCount();
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+    }
 
     DWORD vk = pKb->vkCode;
+
+    // Snapshot the chord-release stamp for this keydown (the manual-switch
+    // check below may need it), then let an ordinary key reset it: only a
+    // modifier release with no ordinary key after it can be a switch chord.
+    const DWORD chordUpTick = g_lastModifierUpTick;
+    if (!IsModifierVk(vk)) g_lastModifierUpTick = 0;
+
+    // Was the last ordinary key Backspace?  (Erasing right before a manual
+    // switch = "typed on the wrong layout", i.e. a missed detection.)
+    const bool prevKeyWasBackspace = g_lastKeyWasBackspace;
+    if (!IsModifierVk(vk)) g_lastKeyWasBackspace = (vk == VK_BACK);
 
     // --- Privacy: password / protected fields ---
     // Never buffer, analyse, log or retype keystrokes while focus is
@@ -1632,7 +1724,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
             return 1; // block the Esc key
         }
-        g_lastCorrection.valid = false;
+        InvalidateCorrection();
     }
 
     // --- Arrow / navigation keys break word continuity ---
@@ -1728,32 +1820,66 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                             windowLang.c_str(), currentLayout.c_str(),
                             g_lastForegroundHwnd, g_lastContextHash);
 
-                        // Confirm a pending TP whose 10 s window already
-                        // expired (no-op if still inside the rejection window,
-                        // so Signal 1 below still fires for genuine rejections).
-                        MaybeConfirmTP();
+                        // When the switch really happened (it is only noticed
+                        // on this keydown, possibly seconds later).
+                        const DWORD detectTick = GetTickCount();
+                        // Was auto-detection active when the user switched?
+                        // (SEARCH is turned off further down this block.)
+                        const bool detectionWasOn = Config::SEARCH.load();
+                        const DWORD switchTick = ManualSwitchTick(chordUpTick, detectTick);
 
                         // ── Feedback: detect rejected correction ──
                         // Two complementary signals:
                         //
-                        // 1) Direct switch-away: correction recently fired,
-                        //    and the user just switched FROM the corrected
-                        //    language to something else.  This is the most
-                        //    common rejection pattern (erase + switch, or
-                        //    just switch then erase/retype).
+                        // 1) Direct switch-away: the user switched FROM the
+                        //    corrected language while still on the corrected
+                        //    text (g_lastCorrection.valid: no click, paste,
+                        //    Enter or arrow since) and WITHOUT having typed in
+                        //    the corrected language (postChars empty: nothing
+                        //    typed, or typed and erased again).  Typing in the
+                        //    corrected language and then switching back is the
+                        //    user accepting the correction and code-switching
+                        //    on purpose (Hebrew text, one English word, back to
+                        //    Hebrew), never a rejection.  Split by strength,
+                        //    because a wrong permanent exception can never be
+                        //    undone by the user, while a missed one repeats:
+                        //    - strong: within SWITCH_AWAY_FAST_MS and back to
+                        //      the original language -> exception + override
+                        //      + FP now.
+                        //    - weak: otherwise up to SWITCH_AWAY_WINDOW_MS
+                        //      -> FP calibration nudge + one strike; the
+                        //      second strike on the same text adds the
+                        //      exception (override only if back to original).
                         //
                         // 2) Pending rejection (Pattern B): backspace erased
                         //    past the correction boundary, then manual switch
                         //    follows within a shorter window.
                         bool feedbackLogged = false;
-                        DWORD now = GetTickCount();
+                        DWORD now = switchTick;
 
-                        // Signal 1: switch away from corrected language
+                        const DWORD sinceCorrection = now - g_lastCorrectionTick;
                         if (!feedbackLogged &&
+                            g_lastCorrection.valid &&
                             g_lastCorrectionTick != 0 &&
-                            (now - g_lastCorrectionTick) < Feedback::SWITCH_AWAY_WINDOW_MS &&
+                            sinceCorrection < Feedback::SWITCH_AWAY_WINDOW_MS &&
+                            g_lastCorrection.postChars.empty() &&
                             windowLang == g_lastCorrectionLang &&
                             g_lastCorrection.correctedLang == g_lastCorrectionLang) {
+                            const bool backToOriginal =
+                                (currentLayout == g_lastCorrection.originalLang);
+                            const bool strong =
+                                sinceCorrection < Feedback::SWITCH_AWAY_FAST_MS &&
+                                backToOriginal;
+
+                            int strikes = 0;
+                            bool learnException = strong;
+                            if (!strong) {
+                                strikes = ++g_rejectionStrikes[{
+                                    g_lastCorrection.correctedLang,
+                                    g_lastCorrection.correctedText }];
+                                learnException = (strikes >= REJECTION_STRIKES_FOR_EXCEPTION);
+                            }
+
                             Feedback::Entry fb;
                             fb.type          = "manual_override";
                             fb.originalText  = g_lastCorrection.originalText;
@@ -1764,23 +1890,33 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                             fb.confidence    = g_lastCorrection.confidence;
                             fb.numChars      = g_lastCorrection.numChars;
                             Feedback::LogEvent(fb);
-                            Feedback::AddException(
-                                g_lastCorrection.correctedLang,
-                                g_lastCorrection.correctedText);
-                            Feedback::AddOverride(
-                                g_lastCorrection.correctedLang,
-                                g_lastCorrection.correctedText,
-                                g_lastCorrection.originalLang);
+                            if (learnException) {
+                                Feedback::AddException(
+                                    g_lastCorrection.correctedLang,
+                                    g_lastCorrection.correctedText);
+                                // The override forces the reverse direction:
+                                // only learn it when the user went back to
+                                // exactly the original language.
+                                if (backToOriginal)
+                                    Feedback::AddOverride(
+                                        g_lastCorrection.correctedLang,
+                                        g_lastCorrection.correctedText,
+                                        g_lastCorrection.originalLang);
+                            }
                             // ── Adaptive calibration: FP signal ──────────
                             Feedback::RecordOutcome(g_lastCorrection.originalLang,
                                                     g_lastCorrection.correctedLang,
                                                     Feedback::Outcome::FalsePositive);
-                            Dbg("FEEDBACK: switch_away %s→%s actual=%s conf=%.3f elapsed=%lums",
+                            Dbg("FEEDBACK: switch_away %s %s→%s actual=%s conf=%.3f "
+                                "elapsed=%lums chordTimed=%d strikes=%d exception=%d",
+                                strong ? "strong" : "weak",
                                 g_lastCorrection.originalLang.c_str(),
                                 g_lastCorrection.correctedLang.c_str(),
                                 currentLayout.c_str(),
                                 g_lastCorrection.confidence,
-                                (unsigned long)(now - g_lastCorrectionTick));
+                                (unsigned long)sinceCorrection,
+                                (int)(switchTick != detectTick),
+                                strikes, (int)learnException);
                             feedbackLogged = true;
                         }
 
@@ -1801,10 +1937,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                             Feedback::AddException(
                                 g_pendingRejection.toLang,
                                 g_pendingRejection.correctedText);
-                            Feedback::AddOverride(
-                                g_pendingRejection.toLang,
-                                g_pendingRejection.correctedText,
-                                g_pendingRejection.fromLang);
+                            // Override only when back to the original language.
+                            if (currentLayout == g_pendingRejection.fromLang)
+                                Feedback::AddOverride(
+                                    g_pendingRejection.toLang,
+                                    g_pendingRejection.correctedText,
+                                    g_pendingRejection.fromLang);
                             // ── Adaptive calibration: FP signal ──────────
                             Feedback::RecordOutcome(g_pendingRejection.fromLang,
                                                     g_pendingRejection.toLang,
@@ -1816,11 +1954,59 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                                 g_pendingRejection.confidence);
                             feedbackLogged = true;
                         }
+
+                        // Typed on in the corrected language, then switched
+                        // away: the user accepted the correction (e.g. one
+                        // English word inside Hebrew text, then back).
+                        // Confirm it now; this switch is deliberate, not a
+                        // missed detection.
+                        bool deliberateSwitch = false;
+                        if (!feedbackLogged &&
+                            g_lastCorrection.valid &&
+                            g_lastCorrectionTick != 0 &&
+                            !g_lastCorrection.postChars.empty() &&
+                            windowLang == g_lastCorrection.correctedLang) {
+                            MaybeConfirmTP(switchTick, /*force=*/true);
+                            deliberateSwitch = true;
+                        }
+
+                        // Not a rejection: confirm a pending TP whose window
+                        // expired (measured at the real switch time).
+                        if (!feedbackLogged)
+                            MaybeConfirmTP(switchTick);
+
+                        // A switch at a word boundary (cache empty or ending in
+                        // a space) with no erasing just before it is the user
+                        // changing language on purpose for the next word.  Only
+                        // a mid-word switch or one right after Backspace looks
+                        // like "typed on the wrong layout" = a missed
+                        // detection.  Counting deliberate switches as misses
+                        // loosened the thresholds and caused false switches.
+                        if (!feedbackLogged && !deliberateSwitch) {
+                            // Mid-word = the last typed char is a letter.  After
+                            // a space or "-" ("ה-" then switch to type "word")
+                            // the user is starting a new word on purpose.
+                            const auto cc = g_cache.GetCache();
+                            const bool midWord = !cc.empty() && iswalpha(cc.back());
+                            // With detection off (already decided for this
+                            // field, or switched manually before) the detector
+                            // could not have acted, so it did not miss anything:
+                            // e.g. Hebrew, switch to English for one word, back.
+                            if (!detectionWasOn) {
+                                deliberateSwitch = true;
+                                Dbg("CALIB: deliberate_switch %s→%s (detection off, not a miss)",
+                                    windowLang.c_str(), currentLayout.c_str());
+                            } else if (!prevKeyWasBackspace && !midWord) {
+                                deliberateSwitch = true;
+                                Dbg("CALIB: deliberate_switch %s→%s (word boundary, not a miss)",
+                                    windowLang.c_str(), currentLayout.c_str());
+                            }
+                        }
                         g_pendingRejection.active = false;
 
                         // Pure voluntary switch (no recent correction rejected):
                         // possible FN — the system failed to auto-switch for this pair.
-                        if (!feedbackLogged) {
+                        if (!feedbackLogged && !deliberateSwitch) {
                             Feedback::RecordOutcome(windowLang, currentLayout,
                                                     Feedback::Outcome::FalseNegative);
                             const DetectTrace& t = g_lastDetectTrace;
@@ -1872,7 +2058,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         if (vk == 'V' || vk == 'X' || vk == 'Z' || vk == VK_BACK) {
             g_cache.Clear();
             g_history.Clear();
-            g_lastCorrection.valid = false;
+            InvalidateCorrection();
             Dbg("SHORTCUT: Ctrl+%c — cache cleared", static_cast<char>(vk == VK_BACK ? 'B' : vk));
         }
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
@@ -1951,6 +2137,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         // after it determines the best candidate language.
         std::string currentLangId = GetCurrentKeyboardLayout();
         std::wstring text = g_cache.GetText();
+
+        // "ה-word" typed on the Hebrew layout: score and convert only the
+        // part after the prefix hyphen (see HebrewHyphenPrefixLen).
+        const size_t hyphenPrefixLen =
+            (currentLangId == "he") ? HebrewHyphenPrefixLen(text) : 0;
+        if (hyphenPrefixLen > 0) text = text.substr(hyphenPrefixLen);
 
         // ── Count alphabetic characters ──────────────────────────────
         // Non-alpha symbols (e.g. //, ;, commas, brackets) must NOT count
@@ -2221,6 +2413,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                     size_t cacheLen = g_cache.Size();
                     auto cacheChars = g_cache.GetCache();
+                    // Keep a Hebrew "ה-" prefix as typed: retype only the tail.
+                    if (hyphenPrefixLen > 0 && hyphenPrefixLen < cacheChars.size()) {
+                        cacheChars.erase(cacheChars.begin(),
+                                         cacheChars.begin() + hyphenPrefixLen);
+                        cacheLen = cacheChars.size();
+                    }
 
                     // Convert cached text to the detected language
                     std::wstring cachedText(cacheChars.begin(), cacheChars.end());
@@ -2303,6 +2501,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     //  • Skip when target is Hebrew (no uppercase letters).
                     if (bestLang != "he" && !correctedText.empty()) {
                         auto shiftStates = g_cache.GetShiftStates();
+                        if (hyphenPrefixLen > 0 && hyphenPrefixLen < shiftStates.size())
+                            shiftStates.erase(shiftStates.begin(),
+                                              shiftStates.begin() + hyphenPrefixLen);
                         for (size_t i = 0;
                              i < correctedText.size() && i < shiftStates.size(); ++i)
                         {

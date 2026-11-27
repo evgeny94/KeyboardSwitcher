@@ -52,8 +52,14 @@ namespace Feedback {
     constexpr unsigned long REJECTION_WINDOW_MS = 5000;
 
     // Time window for direct rejection: manual switch away from
-    // corrected language shortly after a correction fired.
-    constexpr unsigned long SWITCH_AWAY_WINDOW_MS = 10000;
+    // corrected language shortly after a correction fired, while still on
+    // the corrected text.  Within SWITCH_AWAY_FAST_MS with no word finished
+    // since, back to the original language = strong rejection (learned at
+    // once).  Anything else up to SWITCH_AWAY_WINDOW_MS = weak rejection
+    // (calibration nudge + strike; learned on the 2nd strike).  A correction
+    // not rejected is confirmed correct after SWITCH_AWAY_FAST_MS.
+    constexpr unsigned long SWITCH_AWAY_FAST_MS   = 10000;
+    constexpr unsigned long SWITCH_AWAY_WINDOW_MS = 15000;
 
     // ── Public API ──────────────────────────────────────────
 

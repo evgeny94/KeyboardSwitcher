@@ -85,12 +85,16 @@ class TriageParams:
     # Integration thresholds (advisory gating in the detection pipeline)
     suppress_threshold: float = 0.999  # identity evidence >= this => suppress
     suppress_extra: float = 0.08       # added to required confidence
+    suppress_floor: float = 0.97       # ...and required is at least this
     suppress_blocks_gates: bool = True # also veto Tier-3 (->he) gates
     boost_threshold: float = 0.80      # switch-candidate evidence >= this
     boost_scale: float = 0.80          # multiplies required confidence
 
     # Matching behavior
     min_prefix_len: int = 3    # last (partial) word needs this many chars
+    # A shorter trailing fragment is neutral (not counted) when at least
+    # this many complete, attested words precede it.
+    short_tail_min_prior_words: int = 2
     fuzzy_min_len: int = 4     # fuzzy matching only for words this long
 
 
@@ -346,6 +350,17 @@ class LexicalTriage:
         lsh = self._lsh.get(lang)
         exact = fuzzy = lshh = 0
         last = len(words) - 1
+        # A 1-2 char trailing fragment carries almost no information (every
+        # Hebrew letter starts thousands of words), so counting it as
+        # "unattested" made "אין לי מ" score 2/3 and never suppress.  When
+        # enough complete words precede it and all are attested, drop the
+        # fragment from the count instead.  Mirrors LexicalTriage::Evidence.
+        if (len(words) > p.short_tail_min_prior_words
+                and len(words[last]) < p.min_prefix_len
+                and words[last] not in lex
+                and all(w in lex for w in words[:last])):
+            words = words[:last]
+            last -= 1
         for i, w in enumerate(words):
             is_exact = w in lex
             # The last word is still being typed: prefix of a lexicon word

@@ -164,6 +164,7 @@ namespace Config {
     bool  EnableLexicalTriage       = true;
     float TriageSuppressThreshold   = 0.999f;
     float TriageSuppressExtra       = 0.08f;
+    float TriageSuppressFloor       = 0.97f;   // suppressed: required >= this
     bool  TriageSuppressBlocksGates = true;
     float TriageBoostThreshold      = 0.80f;
     float TriageBoostScale          = 0.80f;

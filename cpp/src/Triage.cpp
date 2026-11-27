@@ -102,7 +102,7 @@ float LexicalTriage::Evidence(const std::wstring& text,
     for (wchar_t c : text) norm.push_back(TriageLowerChar(c));
     if (lang == "he") norm = NormalizeHebrewFinals(norm);
 
-    int total = 0, attested = 0;
+    std::vector<std::wstring> words;
     size_t pos = 0;
     const size_t n = norm.size();
     while (pos < n) {
@@ -110,20 +110,33 @@ float LexicalTriage::Evidence(const std::wstring& text,
         if (pos >= n) break;
         size_t end = norm.find(L' ', pos);
         if (end == std::wstring::npos) end = n;
-        const std::wstring word = norm.substr(pos, end - pos);
-        const bool isLast = (end >= n);
-        ++total;
-        if (dawg->Accepts(word)) {
-            ++attested;
-        } else if (isLast && word.size() >= MIN_PREFIX_LEN &&
-                   dawg->AcceptsPrefix(word)) {
-            // The last word is still being typed: a prefix of a lexicon
-            // word counts as exact evidence (mirrors model/triage.py).
-            ++attested;
-        }
+        words.push_back(norm.substr(pos, end - pos));
         pos = end;
     }
-    if (total == 0) return 0.0f;
+    if (words.empty()) return 0.0f;
+
+    int total = 0, attested = 0;
+    for (size_t i = 0; i < words.size(); ++i) {
+        const std::wstring& word = words[i];
+        const bool isLast = (i + 1 == words.size());
+        if (dawg->Accepts(word)) {
+            ++total;
+            ++attested;
+        } else if (isLast && word.size() < MIN_PREFIX_LEN &&
+                   words.size() > SHORT_TAIL_MIN_PRIOR_WORDS &&
+                   attested == total) {
+            // A 1-2 char trailing fragment carries almost no information
+            // (every Hebrew letter starts thousands of words).  Counting it
+            // as unattested made "אין לי מ" score 2/3 and never suppress, so
+            // when enough complete, attested words precede it, it is neutral.
+        } else {
+            ++total;
+            // The last word is still being typed: a prefix of a lexicon
+            // word counts as exact evidence (mirrors model/triage.py).
+            if (isLast && word.size() >= MIN_PREFIX_LEN && dawg->AcceptsPrefix(word))
+                ++attested;
+        }
+    }
     return static_cast<float>(attested) / static_cast<float>(total);
 }
 

@@ -163,6 +163,7 @@ namespace Config {
     extern bool  EnableLexicalTriage;       // master toggle (default: true)
     extern float TriageSuppressThreshold;   // identity evidence >= this => suppress
     extern float TriageSuppressExtra;       // added to required confidence
+    extern float TriageSuppressFloor;       // ...and required is at least this
     extern bool  TriageSuppressBlocksGates; // suppress also vetoes Tier-3 →he gates
     extern float TriageBoostThreshold;      // switch-candidate evidence >= this
     extern float TriageBoostScale;          // multiplies required confidence

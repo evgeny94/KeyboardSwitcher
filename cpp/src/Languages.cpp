@@ -656,8 +656,12 @@ std::optional<DetectionResult> TypoResilientDetect(
             float incEv = triage->Evidence(textVariants[0], currentLang);
             if (incEv >= Config::TriageSuppressThreshold) {
                 lexSuppress = true;
+                // The +extra alone was too weak on long text (required can
+                // be ~0.88 there, so 0.96-confident LSTM noise still fired);
+                // the floor makes attested current-language text hard to flip.
                 requiredConfidence = std::min(0.9999f,
-                    requiredConfidence + Config::TriageSuppressExtra);
+                    std::max(requiredConfidence + Config::TriageSuppressExtra,
+                             Config::TriageSuppressFloor));
             } else {
                 float swEv = triage->Evidence(bestVariant, bestLang);
                 if (swEv >= Config::TriageBoostThreshold)

@@ -44,6 +44,11 @@ public:
     // (mirrors TriageParams.min_prefix_len in model/triage.py).
     static constexpr size_t MIN_PREFIX_LEN = 3;
 
+    // A last word shorter than MIN_PREFIX_LEN is neutral (not counted) when
+    // at least this many complete, attested words precede it
+    // (mirrors TriageParams.short_tail_min_prior_words).
+    static constexpr size_t SHORT_TAIL_MIN_PRIOR_WORDS = 2;
+
 private:
     struct Dawg {
         std::vector<uint32_t> first;      // stateCount+1 (CSR slice bounds)

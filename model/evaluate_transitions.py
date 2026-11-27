@@ -314,7 +314,8 @@ def evaluate_pair(
                 inc_ev = triage.evidence(variants[0], current_lang)
                 if inc_ev >= tparams.suppress_threshold:
                     lex_suppress = True
-                    required = min(0.9999, required + tparams.suppress_extra)
+                    required = min(0.9999, max(required + tparams.suppress_extra,
+                                              tparams.suppress_floor))
                 else:
                     sw_ev = triage.evidence(best_variant, best_lang)
                     if sw_ev >= tparams.boost_threshold:
