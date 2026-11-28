@@ -184,6 +184,7 @@ static void Dbg(const char* fmt, ...) {
 #define WM_UPDATE_CHECK_RESULT  (WM_APP + 2)
 #define WM_UPDATE_DOWNLOAD_DONE (WM_APP + 3)
 #define WM_SECURE_CHECK_DONE    (WM_APP + 6)
+#define WM_ASK_AUTOSTART        (WM_APP + 7)
 
 // Result of the version check (set by bg thread, read by UI thread)
 struct UpdateInfo {
@@ -2691,6 +2692,122 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
 }
 
 // ============================================================
+// On/off options shared by the tray menu and the flyout's Settings page
+// ============================================================
+static const wchar_t kGroupGeneral[] = L"GENERAL";
+static const wchar_t kGroupDiag[]    = L"DIAGNOSTICS";
+static const wchar_t kGroupPrivacy[] = L"PRIVACY & SECURITY";
+
+static void SetStartWithWindows(bool on, HWND owner) {
+    Security::StartWithWindows.store(on);
+    Security::AutostartAsked.store(true);
+    Security::SaveSettings();
+    if (!Security::SyncAutostart()) {
+        MessageBoxW(owner,
+            L"Could not change the Windows startup entry (registry write failed).",
+            L"Keyboard Switcher", MB_OK | MB_ICONWARNING);
+    }
+    Dbg("AUTOSTART: %s", on ? "on" : "off");
+}
+
+static void SetDebugLog(bool on) {
+    DbgSetEnabled(on);
+    Security::DebugLogOnStartup.store(g_debugLogEnabled);   // remembered across restarts
+    Security::SaveSettings();
+    if (g_debugLogEnabled) {
+        Dbg("=== Debug logging enabled (v%s) ===",
+            std::string(Config::VERSION, Config::VERSION + wcslen(Config::VERSION)).c_str());
+    }
+}
+
+static void RegisterOptions() {
+    using Opt = SettingsFlyout::Option;
+    auto switcherOn = [] { return Config::EnableSwitcher.load(); };
+    std::vector<Opt> o;
+    o.push_back({ID_TRAY_ENABLE_SWITCHER, kGroupGeneral, L"Enable Switcher",
+        L"Watch what you type and fix words typed in the wrong keyboard layout. "
+        L"Off: the app stays in the tray and does nothing.",
+        [] { return Config::EnableSwitcher.load(); },
+        [](bool v, HWND) { Config::EnableSwitcher.store(v); }, nullptr});
+    o.push_back({ID_TRAY_START_WINDOWS, kGroupGeneral, L"Start with Windows",
+        L"Start Keyboard Switcher automatically when you sign in to Windows.",
+        [] { return Security::StartWithWindows.load(); },
+        [](bool v, HWND owner) { SetStartWithWindows(v, owner); }, nullptr});
+    o.push_back({ID_TRAY_SAVE_WINDOW, kGroupGeneral, L"Save window state",
+        L"Remember the keyboard language of each window and switch back to it "
+        L"when you return to that window.",
+        [] { return Config::SaveWindowState.load(); },
+        [](bool v, HWND) { Config::SaveWindowState.store(v); }, switcherOn});
+    o.push_back({ID_TRAY_TYPO_RESILIENCE, kGroupGeneral, L"Typo Resilience",
+        L"Still catch a wrong-layout word that contains a typo, and wait for a steady "
+        L"result before switching.",
+        [] { return Config::EnableTypoResilience; },
+        [](bool v, HWND) { Config::EnableTypoResilience = v; }, switcherOn});
+    o.push_back({ID_TRAY_DEBUG_LOG, kGroupDiag, L"Debug Log",
+        L"Write a detailed technical log (ks_debug.log) to help find problems. "
+        L"Stays on after a restart until you turn it off.",
+        [] { return g_debugLogEnabled; },
+        [](bool v, HWND) { SetDebugLog(v); }, nullptr});
+    o.push_back({ID_TRAY_COLLECT_FEEDBACK, kGroupDiag, L"Collect Feedback",
+        L"Record which corrections you kept or undid (feedback.jsonl), "
+        L"used to tune detection.",
+        [] { return Feedback::LoggingEnabled.load(); },
+        [](bool v, HWND) {
+            Feedback::SetLoggingEnabled(v);
+            Security::CollectFeedback.store(Feedback::LoggingEnabled.load());
+            Security::SaveSettings();
+        }, nullptr});
+    o.push_back({ID_TRAY_PROTECT_SECURE, kGroupPrivacy, L"Ignore password fields",
+        L"Never read keystrokes while a password field has focus. Recommended.",
+        [] { return Security::ProtectSecureFields.load(); },
+        [](bool v, HWND owner) {
+            if (!v && MessageBoxW(owner,
+                    L"Turn off password-field protection?\n\n"
+                    L"Keystrokes typed into password fields will then be "
+                    L"analysed (in memory) like any other text.",
+                    L"Keyboard Switcher",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+                return;
+            Security::ProtectSecureFields.store(v);
+            Security::RequestFocusCheck();
+            Security::SaveSettings();
+        }, nullptr});
+    o.push_back({ID_TRAY_REDACT_DEBUG, kGroupPrivacy, L"Hide typed text in debug log",
+        L"The debug log shows only word lengths, not what you typed. "
+        L"Turn off only to debug detection.",
+        [] { return Security::RedactDebugLog.load(); },
+        [](bool v, HWND) { Security::RedactDebugLog.store(v); Security::SaveSettings(); }, nullptr});
+    o.push_back({ID_TRAY_STARTUP_UPDATE, kGroupPrivacy, L"Check for updates on startup",
+        L"A few seconds after start, quietly check GitHub for a newer version.",
+        [] { return Security::CheckUpdatesOnStartup.load(); },
+        [](bool v, HWND) { Security::CheckUpdatesOnStartup.store(v); Security::SaveSettings(); },
+        nullptr});
+    SettingsFlyout::SetOptions(std::move(o));
+    SettingsFlyout::SetOpenDataFolder([] {
+        std::wstring dir = Feedback::GetDataDir();
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    });
+}
+
+static void AppendOption(HMENU m, const SettingsFlyout::Option& o) {
+    UINT f = MF_STRING | (o.get() ? MF_CHECKED : MF_UNCHECKED);
+    if (o.enabled && !o.enabled()) f |= MF_GRAYED;
+    AppendMenuW(m, f, o.id, o.title);
+}
+
+// First launch: ask once whether to start with Windows.
+static void AskAutostart() {
+    if (Security::AutostartAsked.load()) return;
+    int r = MessageBoxW(nullptr,
+        L"Start Keyboard Switcher automatically when Windows starts?\n\n"
+        L"You can change this any time: right-click the tray icon > Start with Windows, "
+        L"or left-click it and open Settings (gear icon).",
+        L"Keyboard Switcher",
+        MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
+    SetStartWithWindows(r == IDYES, nullptr);
+}
+
+// ============================================================
 // Hidden window procedure (tray icon messages + context menu)
 // ============================================================
 static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2708,41 +2825,16 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
             HMENU hMenu = CreatePopupMenu();
             if (hMenu) {
-                AppendMenuW(hMenu,
-                    MF_STRING | (Config::EnableSwitcher.load() ? MF_CHECKED : MF_UNCHECKED),
-                    ID_TRAY_ENABLE_SWITCHER, L"Enable Switcher");
-                AppendMenuW(hMenu,
-                    MF_STRING
-                    | (Config::SaveWindowState.load() ? MF_CHECKED : MF_UNCHECKED)
-                    | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
-                    ID_TRAY_SAVE_WINDOW, L"Save window state");
-                AppendMenuW(hMenu,
-                    MF_STRING
-                    | (Config::EnableTypoResilience ? MF_CHECKED : MF_UNCHECKED)
-                    | (Config::EnableSwitcher.load() ? 0 : MF_GRAYED),
-                    ID_TRAY_TYPO_RESILIENCE, L"Typo Resilience");
-                AppendMenuW(hMenu,
-                    MF_STRING | (g_debugLogEnabled ? MF_CHECKED : MF_UNCHECKED),
-                    ID_TRAY_DEBUG_LOG, L"Debug Log");
-                AppendMenuW(hMenu,
-                    MF_STRING | (Feedback::LoggingEnabled.load() ? MF_CHECKED : MF_UNCHECKED),
-                    ID_TRAY_COLLECT_FEEDBACK, L"Collect Feedback");
-
-                // Privacy & Security submenu (secure defaults; power
-                // users can relax them here or in settings.json).
+                // Privacy & Security options go in a submenu (secure
+                // defaults; power users can relax them here, in the
+                // flyout's Settings page or in settings.json).
                 HMENU hSec = CreatePopupMenu();
-                if (hSec) {
-                    AppendMenuW(hSec,
-                        MF_STRING | (Security::ProtectSecureFields.load() ? MF_CHECKED : MF_UNCHECKED),
-                        ID_TRAY_PROTECT_SECURE, L"Ignore password fields");
-                    AppendMenuW(hSec,
-                        MF_STRING | (Security::RedactDebugLog.load() ? MF_CHECKED : MF_UNCHECKED),
-                        ID_TRAY_REDACT_DEBUG, L"Hide typed text in debug log");
-                    AppendMenuW(hSec,
-                        MF_STRING | (Security::CheckUpdatesOnStartup.load() ? MF_CHECKED : MF_UNCHECKED),
-                        ID_TRAY_STARTUP_UPDATE, L"Check for updates on startup");
-                    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSec, L"Privacy && Security");
+                for (const auto& o : SettingsFlyout::Options()) {
+                    if (o.group == kGroupPrivacy) { if (hSec) AppendOption(hSec, o); }
+                    else AppendOption(hMenu, o);
                 }
+                if (hSec) AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSec, L"Privacy && Security");
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"Settings\x2026");
 
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_FEEDBACK,
@@ -2763,25 +2855,12 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_COMMAND:
+        for (const auto& o : SettingsFlyout::Options()) {
+            if (o.id == LOWORD(wParam)) { o.set(!o.get(), nullptr); return 0; }
+        }
         switch (LOWORD(wParam)) {
-        case ID_TRAY_ENABLE_SWITCHER:
-            Config::EnableSwitcher.store(!Config::EnableSwitcher.load());
-            break;
-        case ID_TRAY_SAVE_WINDOW:
-            Config::SaveWindowState.store(!Config::SaveWindowState.load());
-            break;
-        case ID_TRAY_TYPO_RESILIENCE:
-            Config::EnableTypoResilience = !Config::EnableTypoResilience;
-            break;
-        case ID_TRAY_DEBUG_LOG:
-            DbgSetEnabled(!g_debugLogEnabled);
-            Security::DebugLogOnStartup.store(g_debugLogEnabled);   // remembered across restarts
-            Security::SaveSettings();
-            if (g_debugLogEnabled) {
-                Dbg("=== Debug logging enabled (v%s) ===",
-                    std::string(Config::VERSION,
-                                Config::VERSION + wcslen(Config::VERSION)).c_str());
-            }
+        case ID_TRAY_SETTINGS:
+            SettingsFlyout::Show(hwnd, SettingsFlyout::Page::Settings);
             break;
         case ID_TRAY_ABOUT:
             MessageBoxW(nullptr,
@@ -2789,40 +2868,14 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 L"Esc \x2014 undo last correction\n"
                 L"Left-click tray \x2014 detection settings\n"
                 L"  (per-direction min chars & confidence)\n"
-                L"Right-click tray \x2014 general options\n\n"
+                L"Right-click tray \x2014 general options\n"
+                L"Gear in the flyout \x2014 settings with explanations\n\n"
                 L"\x00A9 2025-2026 Alpha-Numerical",
                 (std::wstring(L"Keyboard Switcher v") + Config::VERSION).c_str(),
                 MB_OK | MB_ICONINFORMATION);
             break;
         case ID_TRAY_CHECK_UPDATE:
             CheckForUpdatesAsync(true);
-            break;
-        case ID_TRAY_COLLECT_FEEDBACK:
-            Feedback::SetLoggingEnabled(!Feedback::LoggingEnabled.load());
-            Security::CollectFeedback.store(Feedback::LoggingEnabled.load());
-            Security::SaveSettings();
-            break;
-        case ID_TRAY_PROTECT_SECURE:
-            if (Security::ProtectSecureFields.load()) {
-                if (MessageBoxW(nullptr,
-                        L"Turn off password-field protection?\n\n"
-                        L"Keystrokes typed into password fields will then be "
-                        L"analysed (in memory) like any other text.",
-                        L"Keyboard Switcher",
-                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
-                    break;
-            }
-            Security::ProtectSecureFields.store(!Security::ProtectSecureFields.load());
-            Security::RequestFocusCheck();
-            Security::SaveSettings();
-            break;
-        case ID_TRAY_REDACT_DEBUG:
-            Security::RedactDebugLog.store(!Security::RedactDebugLog.load());
-            Security::SaveSettings();
-            break;
-        case ID_TRAY_STARTUP_UPDATE:
-            Security::CheckUpdatesOnStartup.store(!Security::CheckUpdatesOnStartup.load());
-            Security::SaveSettings();
             break;
         case ID_TRAY_OPEN_FEEDBACK: {
             std::wstring dir = Feedback::GetDataDir();
@@ -2853,6 +2906,10 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
     case WM_UPDATE_CHECK_RESULT:
         HandleUpdateCheckResult();
+        return 0;
+
+    case WM_ASK_AUTOSTART:
+        AskAutostart();
         return 0;
 
     case WM_SECURE_CHECK_DONE:
@@ -2908,13 +2965,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         std::wstring out;
         bool dark = false, demo = false;
+        auto page = SettingsFlyout::Page::Detection;
         float scale = 1.0f;
+        RegisterOptions();
         for (int i = 1; argv && i < argc; ++i) {
             std::wstring a = argv[i];
             std::wstring next = (i + 1 < argc) ? argv[i + 1] : L"";
             if (a == L"--render-flyout") { out = next; ++i; }
             else if (a == L"--flyout-demo") demo = true;
             else if (a == L"--theme") { dark = (next == L"dark"); ++i; }
+            else if (a == L"--page") {
+                if (next == L"settings") page = SettingsFlyout::Page::Settings;
+                ++i;
+            }
             else if (a == L"--scale") { scale = static_cast<float>(_wtof(next.c_str())); ++i; }
             else if (a == L"--assume-installed") {
                 unsigned mask = 0;
@@ -2932,7 +2995,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         Feedback::Init();          // read-only here: shows the user's base floors
         SettingsFlyout::SyncGlobalEarlyOut();
         if (demo) { SettingsFlyout::RunDemo(); return 0; }
-        return (!out.empty() && SettingsFlyout::RenderToBitmapFile(out, dark, scale)) ? 0 : 1;
+        return (!out.empty() && SettingsFlyout::RenderToBitmapFile(out, dark, scale, page)) ? 0 : 1;
     }
 
     // COM (apartment-threaded) for MSAA password-field detection
@@ -3023,6 +3086,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
             Feedback::LoggingEnabled.store(true);
     }
 
+    // Start with Windows: re-write the Run value from settings.json on
+    // every launch (an update's uninstall step removes it; the exe path
+    // may have changed).  Only when on: "off" never touches the registry.
+    if (Security::StartWithWindows.load()) Security::SyncAutostart();
+    RegisterOptions();
+
     // Seed focus-tracking globals so the first keystroke doesn't
     // trigger a spurious HandleFocusChange.
     g_lastForegroundHwnd = GetForegroundWindow();
@@ -3102,6 +3171,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     // starts up smoothly; silent if already on the latest version).
     if (Security::CheckUpdatesOnStartup.load())
         CheckForUpdatesAsync(false, 3);
+
+    // First launch: one-time "start with Windows?" question (posted so it
+    // runs from the message loop, after the hooks are live).
+    if (!Security::AutostartAsked.load())
+        PostMessageW(g_hwndHidden, WM_ASK_AUTOSTART, 0, 0);
 
     // Message loop (required for low-level hooks to work)
     MSG msg;

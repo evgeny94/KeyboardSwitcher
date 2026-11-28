@@ -34,6 +34,18 @@ namespace Security {
     extern std::atomic<bool> DebugLogOnStartup;
     extern std::atomic<bool> CollectFeedback;
 
+    // Start with Windows (HKCU\...\Run\KeyboardSwitcher).  The choice
+    // lives in settings.json ("start_with_windows") and the Run value is
+    // re-synced to it on every launch, so an update / reinstall (whose
+    // uninstall step removes the Run value) never loses it.
+    //   "autostart_asked": the one-time "start with Windows?" question
+    //                      has been answered.
+    extern std::atomic<bool> StartWithWindows;
+    extern std::atomic<bool> AutostartAsked;
+    // Write or delete the Run value to match StartWithWindows (points at
+    // the running exe).  Returns false if the registry write failed.
+    bool SyncAutostart();
+
     // Load settings.json (missing / corrupt file → secure defaults).
     void LoadSettings();
     // Persist current settings to settings.json.

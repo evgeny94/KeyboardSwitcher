@@ -244,7 +244,11 @@ set(KS_NSIS_CLOSE_APP
   Pop $0
   Sleep 500")
 set(CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}")
-set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}")
+# Uninstall also drops the "Start with Windows" Run value.  An update runs
+# the old uninstaller first, so the app re-writes the value on its next
+# launch from settings.json ("start_with_windows").
+set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "${KS_NSIS_CLOSE_APP}
+  DeleteRegValue HKCU 'Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run' 'KeyboardSwitcher'")
 
 # Finish page: "Start Keyboard Switcher now" (checked) and "Turn on the
 # debug log" (unchecked).  The app is started through explorer.exe so it

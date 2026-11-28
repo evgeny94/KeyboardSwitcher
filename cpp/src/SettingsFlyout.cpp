@@ -138,7 +138,8 @@ static Theme MakeTheme(bool dark) {
 
 // ── Layout model ─────────────────────────────────────────────
 
-enum class Kind { LangChip, AutoExclude, DirToggle, Minus, Plus, Floor, ShortConf, Reset };
+enum class Kind { LangChip, AutoExclude, DirToggle, Minus, Plus, Floor, ShortConf, Reset,
+                  Gear, Back, OptToggle, OpenFolder };
 
 struct Item {
     Kind kind;
@@ -148,7 +149,10 @@ struct Item {
     std::wstring tip;
 };
 
-enum class Font { Title, Body, BodyStrong, Caption, Section };
+// Wrap = caption size, word-wrapped, top-aligned (option explanations).
+// Icon = Segoe Fluent Icons / MDL2 Assets glyphs (gear, back arrow).
+enum class Font { Title, Body, BodyStrong, Caption, Section, Wrap, Icon };
+static constexpr int kNumFonts = 7;
 
 struct Label {
     std::wstring text;
@@ -169,6 +173,19 @@ struct Layout {
 
 static bool g_noPersist = false;   // preview / demo: never write settings
 
+static Page                  g_page = Page::Detection;
+static std::vector<Option>   g_options;
+static std::function<void()> g_openFolder;
+static bool                  g_inAction = false;   // an option's setter may show a dialog
+
+void SetOptions(std::vector<Option> opts) { g_options = std::move(opts); }
+const std::vector<Option>& Options() { return g_options; }
+void SetOpenDataFolder(std::function<void()> fn) { g_openFolder = std::move(fn); }
+
+static bool OptEnabled(const Option& o) { return !o.enabled || o.enabled(); }
+
+static float MeasureWrapHeight(const std::wstring& s, float width);   // below (needs Gfx)
+
 static bool LangShown(const std::string& l) {
     return !LangAvail::GetAutoExclude() || LangAvail::IsInstalled(l);
 }
@@ -186,12 +203,14 @@ static int MinChars(int i) {
                                              : kFactoryMinChars[i];
 }
 
-static Layout BuildLayout() {
+static Layout BuildDetectionLayout() {
     Layout L;
     const float pad = 16, cw = kWidth - 2 * pad;
     float y = 14;
 
-    L.labels.push_back({L"Detection settings", {pad, y, pad + cw, y + 28}, Font::Title, false, false});
+    L.labels.push_back({L"Detection settings", {pad, y, pad + cw - 40, y + 28}, Font::Title, false, false});
+    L.items.push_back({Kind::Gear, 0, {pad + cw - 32, y - 2, pad + cw, y + 30}, true,
+                       L"Settings: start with Windows, debug log, privacy and other options."});
     y += 28;
     L.labels.push_back({L"Fix text typed in the wrong keyboard layout.",
                         {pad, y, pad + cw, y + 18}, Font::Caption, false, true});
@@ -324,6 +343,64 @@ static Layout BuildLayout() {
     return L;
 }
 
+// Settings page: the shared option list, grouped into cards, each row a
+// title + explanation + switch.
+static Layout BuildSettingsLayout() {
+    Layout L;
+    const float pad = 16, cw = kWidth - 2 * pad;
+    float y = 14;
+
+    L.items.push_back({Kind::Back, 0, {pad - 4, y - 2, pad + 28, y + 30}, true,
+                       L"Back to detection settings"});
+    L.labels.push_back({L"Settings", {pad + 36, y, pad + cw, y + 28}, Font::Title, false, false});
+    y += 28;
+    L.labels.push_back({L"Also in the tray icon's right-click menu.",
+                        {pad + 36, y, pad + cw, y + 18}, Font::Caption, false, true});
+    y += 30;
+
+    const float ip = 14, x0 = pad + ip, x1 = pad + cw - ip;
+    const float textW = (x1 - 52) - x0;
+    const wchar_t* group = nullptr;
+    float cardTop = 0;
+    auto closeCard = [&]() {
+        if (!group) return;
+        L.cards.push_back({pad, cardTop, pad + cw, y});
+        y += 16;
+    };
+    for (size_t n = 0; n < g_options.size(); ++n) {
+        const Option& o = g_options[n];
+        if (!group || wcscmp(group, o.group) != 0) {
+            closeCard();
+            group = o.group;
+            L.labels.push_back({o.group, {pad, y, pad + cw, y + 16}, Font::Section, false, true});
+            y += 22;
+            cardTop = y;
+        } else {
+            L.seps.push_back(y);
+        }
+        const bool en = OptEnabled(o);
+        L.labels.push_back({o.title, {x0, y + 12, x1 - 52, y + 32}, Font::BodyStrong, !en, false});
+        L.items.push_back({Kind::OptToggle, static_cast<int>(n), {x1 - 40, y + 12, x1, y + 32}, en, L""});
+        const float dh = MeasureWrapHeight(o.desc, textW);
+        L.labels.push_back({o.desc, {x0, y + 34, x0 + textW, y + 34 + dh}, Font::Wrap, !en, true});
+        y += 34 + dh + 12;
+    }
+    closeCard();
+
+    L.items.push_back({Kind::OpenFolder, 0, {pad + cw - 160, y, pad + cw, y + 32}, true,
+                       L"Open the folder with settings.json, the debug log (ks_debug.log) and "
+                       L"the feedback log."});
+    L.labels.push_back({std::wstring(L"v") + Config::VERSION, {pad, y, pad + 120, y + 32},
+                        Font::Caption, false, true});
+    y += 32 + 16;
+    L.height = y;
+    return L;
+}
+
+static Layout BuildLayout() {
+    return g_page == Page::Settings ? BuildSettingsLayout() : BuildDetectionLayout();
+}
+
 // ── Actions ──────────────────────────────────────────────────
 
 void SyncGlobalEarlyOut() {
@@ -383,8 +460,22 @@ static void SetSliderFromX(const Item& it, float x) {
     }
 }
 
-static void Activate(const Item& it) {
+static void Activate(const Item& it, HWND owner) {
     switch (it.kind) {
+    case Kind::Gear: g_page = Page::Settings;  break;
+    case Kind::Back: g_page = Page::Detection; break;
+    case Kind::OptToggle: {
+        if (it.index < 0 || it.index >= static_cast<int>(g_options.size())) break;
+        const Option& o = g_options[it.index];
+        if (g_noPersist || !o.set) break;          // preview: look, don't touch
+        g_inAction = true;                         // a confirm box must not light-dismiss us
+        o.set(!o.get(), owner);
+        g_inAction = false;
+        break;
+    }
+    case Kind::OpenFolder:
+        if (!g_noPersist && g_openFolder) g_openFolder();
+        break;
     case Kind::LangChip: {
         const char* l = LangAvail::kLangs[it.index];
         LangAvail::SetLangEnabled(l, !LangAvail::GetLangEnabled(l));
@@ -414,7 +505,7 @@ template <class T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = n
 struct Gfx {
     ID2D1Factory*        d2d   = nullptr;
     IDWriteFactory*      dw    = nullptr;
-    IDWriteTextFormat*   fmt[5] = {};
+    IDWriteTextFormat*   fmt[kNumFonts] = {};
     float                fmtScale = 0;
 
     bool Init() {
@@ -443,26 +534,50 @@ struct Gfx {
         const wchar_t* display = HasFamily(L"Segoe UI Variable Display") ? L"Segoe UI Variable Display" : L"Segoe UI";
         const wchar_t* text    = HasFamily(L"Segoe UI Variable Text")    ? L"Segoe UI Variable Text"    : L"Segoe UI";
         const wchar_t* small   = HasFamily(L"Segoe UI Variable Small")   ? L"Segoe UI Variable Small"   : L"Segoe UI";
-        struct { const wchar_t* fam; DWRITE_FONT_WEIGHT w; float size; } spec[5] = {
+        const wchar_t* icons   = HasFamily(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
+        struct { const wchar_t* fam; DWRITE_FONT_WEIGHT w; float size; } spec[kNumFonts] = {
             { display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 20.0f },   // Title
             { text,    DWRITE_FONT_WEIGHT_REGULAR,   14.0f },   // Body
             { text,    DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0f },   // BodyStrong
             { small,   DWRITE_FONT_WEIGHT_REGULAR,   12.0f },   // Caption
             { small,   DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0f },   // Section
+            { small,   DWRITE_FONT_WEIGHT_REGULAR,   12.0f },   // Wrap
+            { icons,   DWRITE_FONT_WEIGHT_REGULAR,   16.0f },   // Icon
         };
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < kNumFonts; ++i) {
             dw->CreateTextFormat(spec[i].fam, nullptr, spec[i].w, DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_FONT_STRETCH_NORMAL, spec[i].size, L"en-us", &fmt[i]);
-            if (fmt[i]) {
-                fmt[i]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                fmt[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-                DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
-                fmt[i]->SetTrimming(&trim, nullptr);
+            if (!fmt[i]) continue;
+            if (i == static_cast<int>(Font::Wrap)) {
+                fmt[i]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                fmt[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                continue;
             }
+            fmt[i]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            fmt[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+            fmt[i]->SetTrimming(&trim, nullptr);
         }
     }
 };
 static Gfx g_gfx;
+
+// Height (DIP) of word-wrapped explanation text at |width|.
+static float MeasureWrapHeight(const std::wstring& s, float width) {
+    const float fallback = 32.0f;   // two caption lines
+    if (!g_gfx.Init()) return fallback;
+    g_gfx.EnsureFormats();
+    IDWriteTextFormat* tf = g_gfx.fmt[static_cast<int>(Font::Wrap)];
+    if (!tf) return fallback;
+    IDWriteTextLayout* tl = nullptr;
+    if (FAILED(g_gfx.dw->CreateTextLayout(s.c_str(), static_cast<UINT32>(s.size()), tf,
+                                          width, 1000.0f, &tl)) || !tl)
+        return fallback;
+    DWRITE_TEXT_METRICS m = {};
+    float h = SUCCEEDED(tl->GetMetrics(&m)) ? std::ceil(m.height) : fallback;
+    tl->Release();
+    return h;
+}
 
 struct PaintState {
     int  hot     = -1;
@@ -470,8 +585,9 @@ struct PaintState {
 };
 
 static void Draw(ID2D1RenderTarget* rt, const Layout& L, const Theme& th,
-                 const PaintState& ps, float scale) {
-    rt->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale));
+                 const PaintState& ps, float scale, float scrollY) {
+    rt->SetTransform(D2D1::Matrix3x2F::Translation(0, -scrollY) *
+                     D2D1::Matrix3x2F::Scale(scale, scale));
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     rt->Clear(th.bg);
 
@@ -523,11 +639,27 @@ static void Draw(ID2D1RenderTarget* rt, const Layout& L, const Theme& th,
         const float cy = (r.top + r.bottom) / 2;
 
         switch (it.kind) {
+        case Kind::Gear:
+        case Kind::Back: {
+            if (hot || down) fill(r, 4, down ? th.ctrlFill : th.ctrlHover);
+            if (hot && !down) fill(r, 4, D2D1::ColorF(th.dark ? 0xFFFFFF : 0x000000, 0.04f));
+            // E713 = Setting (gear), E72B = Back: same code points in
+            // Segoe Fluent Icons (Win11) and Segoe MDL2 Assets (Win10).
+            text(it.kind == Kind::Gear ? L"\xE713" : L"\xE72B", r, Font::Icon,
+                 down ? th.text2 : th.text, DWRITE_TEXT_ALIGNMENT_CENTER);
+            break;
+        }
         case Kind::AutoExclude:
-        case Kind::DirToggle: {
-            bool on = it.kind == Kind::AutoExclude
-                ? LangAvail::GetAutoExclude()
-                : LangAvail::GetDirectionEnabled(kFrom[it.index], kTo[it.index]);
+        case Kind::DirToggle:
+        case Kind::OptToggle: {
+            bool on;
+            if (it.kind == Kind::OptToggle)
+                on = it.index < static_cast<int>(g_options.size()) && g_options[it.index].get &&
+                     g_options[it.index].get();
+            else if (it.kind == Kind::AutoExclude)
+                on = LangAvail::GetAutoExclude();
+            else
+                on = LangAvail::GetDirectionEnabled(kFrom[it.index], kTo[it.index]);
             const float h = r.bottom - r.top, rad = h / 2;
             if (!it.enabled) {
                 stroke(r, rad, th.text3);
@@ -563,12 +695,14 @@ static void Draw(ID2D1RenderTarget* rt, const Layout& L, const Theme& th,
         }
         case Kind::Minus:
         case Kind::Plus:
-        case Kind::Reset: {
+        case Kind::Reset:
+        case Kind::OpenFolder: {
             fill(r, 4, down ? th.ctrlFill : (hot ? th.ctrlHover : th.ctrlFill));
             if (hot && !down) fill(r, 4, D2D1::ColorF(th.dark ? 0xFFFFFF : 0x000000, 0.03f));
             stroke(r, 4, th.ctrlStroke);
             const wchar_t* glyph = it.kind == Kind::Minus ? L"−"
-                                 : it.kind == Kind::Plus  ? L"+" : L"Reset defaults";
+                                 : it.kind == Kind::Plus  ? L"+"
+                                 : it.kind == Kind::Reset ? L"Reset defaults" : L"Open data folder";
             text(glyph, r, Font::Body, it.enabled ? (down ? th.text2 : th.text) : th.text3,
                  DWRITE_TEXT_ALIGNMENT_CENTER);
             break;
@@ -595,7 +729,7 @@ static void Draw(ID2D1RenderTarget* rt, const Layout& L, const Theme& th,
 
 // Render the layout into a 32-bpp premultiplied DIB selected into |memDC|.
 static bool RenderToDC(HDC memDC, int w, int h, const Layout& L, const Theme& th,
-                       const PaintState& ps, float scale) {
+                       const PaintState& ps, float scale, float scrollY = 0) {
     if (!g_gfx.Init()) return false;
     g_gfx.EnsureFormats();
     D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
@@ -608,7 +742,7 @@ static bool RenderToDC(HDC memDC, int w, int h, const Layout& L, const Theme& th
     bool ok = false;
     if (SUCCEEDED(rt->BindDC(memDC, &rc))) {
         rt->BeginDraw();
-        Draw(rt, L, th, ps, scale);
+        Draw(rt, L, th, ps, scale, scrollY);
         ok = SUCCEEDED(rt->EndDraw());
     }
     rt->Release();
@@ -637,8 +771,12 @@ struct FlyoutState {
     PaintState ps;
     int        drag     = -1;
     bool       tracking = false;
+    float      scrollY  = 0;     // DIP; > 0 only when the page is taller than the screen
+    float      viewH    = 0;     // visible height, DIP
 };
 static FlyoutState g_fly;
+
+static float MaxScroll() { return std::max(0.0f, g_fly.layout.height - g_fly.viewH); }
 
 using GetDpiForWindowFn = UINT (WINAPI*)(HWND);
 using SetThreadDpiCtxFn = HANDLE (WINAPI*)(HANDLE);
@@ -652,6 +790,7 @@ static UINT WindowDpi(HWND hwnd) {
 }
 
 static int HitTest(float x, float y) {
+    y += g_fly.scrollY;
     const auto& items = g_fly.layout.items;
     for (size_t i = 0; i < items.size(); ++i) {
         const auto& r = items[i].r;
@@ -670,7 +809,7 @@ static void RebuildTooltips() {
     if (!g_fly.tip) return;
     SendMessageW(g_fly.tip, TTM_SETMAXTIPWIDTH, 0, static_cast<LPARAM>(320 * g_fly.scale));
     SendMessageW(g_fly.tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 15000);
-    const float s = g_fly.scale;
+    const float s = g_fly.scale, dy = g_fly.scrollY;
     for (size_t i = 0; i < g_fly.layout.items.size(); ++i) {
         const Item& it = g_fly.layout.items[i];
         if (it.tip.empty()) continue;
@@ -679,8 +818,8 @@ static void RebuildTooltips() {
         ti.uFlags   = TTF_SUBCLASS;
         ti.hwnd     = hwnd;
         ti.uId      = i + 1;
-        ti.rect     = { static_cast<LONG>(it.r.left * s), static_cast<LONG>(it.r.top * s),
-                        static_cast<LONG>(it.r.right * s), static_cast<LONG>(it.r.bottom * s) };
+        ti.rect     = { static_cast<LONG>(it.r.left * s), static_cast<LONG>((it.r.top - dy) * s),
+                        static_cast<LONG>(it.r.right * s), static_cast<LONG>((it.r.bottom - dy) * s) };
         ti.lpszText = const_cast<wchar_t*>(it.tip.c_str());
         SendMessageW(g_fly.tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
     }
@@ -699,13 +838,25 @@ static void ApplyDwmStyle(HWND hwnd) {
 
 // Resize to the current layout; the bottom edge stays anchored (the
 // flyout opens above the taskbar).
+// Visible height (DIP): the whole page, or the monitor's work area minus
+// margins when the page is taller (the rest scrolls with the wheel).
+static float FitViewHeight(const RECT& work) {
+    const float avail = (work.bottom - work.top) / g_fly.scale - 2 * 12.0f;
+    return std::min(g_fly.layout.height, std::max(100.0f, avail));
+}
+
 static void Relayout(bool keepBottom) {
     g_fly.layout = BuildLayout();
     HWND hwnd = g_fly.hwnd;
     RECT wr; GetWindowRect(hwnd, &wr);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    g_fly.viewH   = FitViewHeight(mi.rcWork);
+    g_fly.scrollY = std::clamp(g_fly.scrollY, 0.0f, MaxScroll());
     int w = static_cast<int>(std::ceil(kWidth * g_fly.scale));
-    int h = static_cast<int>(std::ceil(g_fly.layout.height * g_fly.scale));
+    int h = static_cast<int>(std::ceil(g_fly.viewH * g_fly.scale));
     int top = keepBottom ? wr.bottom - h : wr.top;
+    top = std::max(top, static_cast<int>(mi.rcWork.top));
     SetWindowPos(hwnd, nullptr, wr.left, top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     RebuildTooltips();
     InvalidateRect(hwnd, nullptr, FALSE);
@@ -737,7 +888,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HBITMAP bmp = CreateDib(dc, w, h, &bits);
         if (mem && bmp) {
             HGDIOBJ old = SelectObject(mem, bmp);
-            RenderToDC(mem, w, h, g_fly.layout, g_fly.theme, g_fly.ps, g_fly.scale);
+            RenderToDC(mem, w, h, g_fly.layout, g_fly.theme, g_fly.ps, g_fly.scale, g_fly.scrollY);
             BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
         }
@@ -805,9 +956,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ReleaseCapture();
         if (!wasDrag && pressed >= 0 && pressed == HitTest(x, y)) {
             Item it = g_fly.layout.items[pressed];
-            Activate(it);
+            Activate(it, hwnd);
+            if (!IsWindow(hwnd) || g_fly.hwnd != hwnd) return 0;   // closed meanwhile
+            bool pageSwitch = it.kind == Kind::Gear || it.kind == Kind::Back;
             bool structural = it.kind == Kind::LangChip || it.kind == Kind::AutoExclude ||
-                              it.kind == Kind::Reset;
+                              it.kind == Kind::Reset || pageSwitch;
+            if (pageSwitch) { g_fly.scrollY = 0; g_fly.ps.hot = -1; }
+            if (it.kind == Kind::OptToggle) SetForegroundWindow(hwnd);   // after a confirm box
             if (structural) Relayout(true); else { RefreshLabels(); RebuildTooltips(); }
         } else {
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -819,12 +974,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_fly.ps.pressed = -1;
         return 0;
 
+    case WM_MOUSEWHEEL: {
+        if (MaxScroll() <= 0) return 0;
+        const float step = 48.0f * GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+        g_fly.scrollY = std::clamp(g_fly.scrollY - step, 0.0f, MaxScroll());
+        RebuildTooltips();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
         break;
 
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) DestroyWindow(hwnd);   // light-dismiss
+        // Light-dismiss — except while an option shows a confirm box.
+        if (LOWORD(wParam) == WA_INACTIVE && !g_inAction) DestroyWindow(hwnd);
         return 0;
 
     case WM_DPICHANGED: {
@@ -884,11 +1049,12 @@ static void Open(HWND owner) {
     ApplyDwmStyle(hwnd);
     g_fly.layout = BuildLayout();
 
-    const int w = static_cast<int>(std::ceil(kWidth * g_fly.scale));
-    const int h = static_cast<int>(std::ceil(g_fly.layout.height * g_fly.scale));
     MONITORINFO mi = { sizeof(mi) };
     GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
     const RECT& wa = mi.rcWork;
+    g_fly.viewH = FitViewHeight(wa);
+    const int w = static_cast<int>(std::ceil(kWidth * g_fly.scale));
+    const int h = static_cast<int>(std::ceil(g_fly.viewH * g_fly.scale));
     const int gap = static_cast<int>(12 * g_fly.scale);
     int x = std::clamp(static_cast<int>(pt.x - w / 2), static_cast<int>(wa.left + gap),
                        static_cast<int>(wa.right - w - gap));
@@ -904,13 +1070,27 @@ static void Open(HWND owner) {
 
 void Toggle(HWND owner) {
     if (g_fly.hwnd) { DestroyWindow(g_fly.hwnd); return; }
+    g_page = Page::Detection;
+    Open(owner);
+}
+
+void Show(HWND owner, Page page) {
+    g_page = page;
+    if (g_fly.hwnd) {
+        g_fly.scrollY = 0;
+        g_fly.ps = {};
+        Relayout(true);
+        SetForegroundWindow(g_fly.hwnd);
+        return;
+    }
     Open(owner);
 }
 
 // ── Developer / CI helpers ───────────────────────────────────
 
-bool RenderToBitmapFile(const std::wstring& path, bool dark, float scale) {
+bool RenderToBitmapFile(const std::wstring& path, bool dark, float scale, Page page) {
     g_noPersist = true;
+    g_page = page;
     Layout L = BuildLayout();
     Theme th = MakeTheme(dark);
     int w = static_cast<int>(std::ceil(kWidth * scale));

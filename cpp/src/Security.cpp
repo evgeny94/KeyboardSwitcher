@@ -30,7 +30,35 @@ std::atomic<bool> CheckUpdatesOnStartup{true};
 std::atomic<bool> RequireVerifiedUpdates{true};
 std::atomic<bool> DebugLogOnStartup{false};
 std::atomic<bool> CollectFeedback{false};
+std::atomic<bool> StartWithWindows{false};
+std::atomic<bool> AutostartAsked{false};
 std::atomic<bool> SecureFieldFocused{false};
+
+// ── Start with Windows ───────────────────────────────────────
+
+static const wchar_t kRunKey[]   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunValue[] = L"KeyboardSwitcher";
+
+bool SyncAutostart() {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
+                        KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+    LONG rc;
+    if (StartWithWindows.load()) {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\"";
+        rc = RegSetValueExW(key, kRunValue, 0, REG_SZ,
+                            reinterpret_cast<const BYTE*>(cmd.c_str()),
+                            static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        rc = RegDeleteValueW(key, kRunValue);
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
 
 // ── settings.json ────────────────────────────────────────────
 
@@ -58,6 +86,8 @@ void LoadSettings() {
         flag("require_verified_updates", RequireVerifiedUpdates);
         flag("debug_log",                DebugLogOnStartup);
         flag("collect_feedback",         CollectFeedback);
+        flag("start_with_windows",       StartWithWindows);
+        flag("autostart_asked",          AutostartAsked);
         LangAvail::FromJson(j);
     } catch (...) {
         // Corrupt file — keep secure defaults
@@ -74,6 +104,8 @@ void SaveSettings() {
     j["require_verified_updates"] = RequireVerifiedUpdates.load();
     j["debug_log"]                = DebugLogOnStartup.load();
     j["collect_feedback"]         = CollectFeedback.load();
+    j["start_with_windows"]       = StartWithWindows.load();
+    j["autostart_asked"]          = AutostartAsked.load();
     LangAvail::ToJson(j);
     // Write a temp file and swap it in: a crash never leaves a truncated
     // settings.json (which would silently reset everything to defaults).
